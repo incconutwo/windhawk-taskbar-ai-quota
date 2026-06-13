@@ -2,7 +2,7 @@
 // @id              taskbar-ai-quota
 // @name            Taskbar AI Quota Bars
 // @description     Shows LLM/agent quota usage for Anthropic and OpenAI as compact bars on the Windows 11 taskbar, left of the system tray
-// @version         0.1
+// @version         0.2
 // @author          Cleroth
 // @include         explorer.exe
 // @architecture    x86-64
@@ -26,31 +26,35 @@ Stale errors can mark labels/tooltips with `!`.
 Hover for exact percentages/reset times. Click a column to refresh.
 
 Credentials are read-only. The mod never refreshes or rewrites tokens.
-Default source: `%USERPROFILE%\.local\share\opencode\auth.json`.
+Default accounts read `%USERPROFILE%\.local\share\opencode\auth.json`.
+Other provider choices can read Claude Code's `%USERPROFILE%\.claude\.credentials.json`
+or Codex's `%USERPROFILE%\.codex\auth.json`.
 */
 // ==/WindhawkModReadme==
 
 // ==WindhawkModSettings==
 /*
 - accounts:
-    - - provider: anthropic
+    - - provider: anthropic-opencode
         $name: Provider
-        $description: 'Default accounts: anthropic and openai'
+        $description: 'Choose the API provider and credential source.'
         $options:
-          - anthropic: Anthropic (Claude OAuth)
-          - openai: OpenAI (Codex OAuth)
+          - anthropic-opencode: Anthropic (OpenCode)
+          - openai-opencode: OpenAI (OpenCode)
+          - anthropic-claude-code: Anthropic (Claude Code)
+          - openai-codex: OpenAI (Codex)
       - label: A
         $name: Label
         $description: 'Default: A for Anthropic, O for OpenAI'
-      - authFile: '%USERPROFILE%\.local\share\opencode\auth.json'
+      - authFile: ""
         $name: Auth file
-        $description: 'Default: %USERPROFILE%\.local\share\opencode\auth.json'
+        $description: 'Default: empty = provider default. OpenCode: %USERPROFILE%\.local\share\opencode\auth.json; Claude Code: %USERPROFILE%\.claude\.credentials.json; Codex: %USERPROFILE%\.codex\auth.json'
       - authKey: ""
         $name: Auth JSON key
-        $description: 'Default: empty. For opencode auth.json, empty means use the provider name.'
-    - - provider: openai
+        $description: 'Default: empty. OpenCode uses anthropic/openai; Claude Code and Codex ignore this.'
+    - - provider: openai-opencode
       - label: O
-      - authFile: '%USERPROFILE%\.local\share\opencode\auth.json'
+      - authFile: ""
       - authKey: ""
   $name: Accounts
   $description: 'Default: two accounts, Anthropic A and OpenAI O'
@@ -140,6 +144,7 @@ namespace wuxi = winrt::Windows::UI::Xaml::Input;
 
 struct AccountConfig {
     std::wstring provider;
+    std::wstring authSource;
     std::wstring label;
     std::wstring authFile;
     std::wstring authKey;
@@ -214,7 +219,9 @@ static int g_quotaColumn = -1;
 static std::vector<TapHandler> g_tapHandlers;
 
 static const wchar_t* kRootName = L"AiQuota_Root";
-static const wchar_t* kDefaultAuthFile = L"%USERPROFILE%\\.local\\share\\opencode\\auth.json";
+static const wchar_t* kDefaultOpenCodeAuthFile = L"%USERPROFILE%\\.local\\share\\opencode\\auth.json";
+static const wchar_t* kDefaultClaudeCodeAuthFile = L"%USERPROFILE%\\.claude\\.credentials.json";
+static const wchar_t* kDefaultCodexAuthFile = L"%USERPROFILE%\\.codex\\auth.json";
 
 using WindowThreadProc = void (*)(void*);
 static bool RunFromWindowThread(HWND hWnd, WindowThreadProc proc, void* param);
@@ -456,30 +463,50 @@ static AuthInfo LoadAuthInfo(const AccountConfig& acc) {
         return a;
     }
 
-    std::wstring key = acc.authKey.empty() ? acc.provider : acc.authKey;
-    if (auto entry = GetObj(root, key.c_str()); entry && entry.HasKey(L"access")) {
-        a.accessToken = GetStr(entry, L"access");
-        a.accountId = GetStr(entry, L"accountId");
-        a.expiresMs = (ULONGLONG)GetNum(entry, L"expires", 0);
-        a.ok = !a.accessToken.empty();
-        if (!a.ok) a.err = L"no access token";
-        return a;
+    bool legacyAutoSource = acc.authSource == L"auto";
+
+    if (acc.authSource == L"opencode" || legacyAutoSource) {
+        std::wstring key = acc.authKey.empty() ? acc.provider : acc.authKey;
+        if (auto entry = GetObj(root, key.c_str())) {
+            a.accessToken = GetStr(entry, L"access");
+            a.accountId = GetStr(entry, L"accountId");
+            a.expiresMs = (ULONGLONG)GetNum(entry, L"expires", 0);
+            a.ok = !a.accessToken.empty();
+            if (!a.ok) a.err = L"no access token";
+            if (a.ok || !legacyAutoSource) return a;
+        }
+        if (!legacyAutoSource) {
+            a.err = L"no OpenCode credentials found";
+            return a;
+        }
     }
 
-    if (auto entry = GetObj(root, L"claudeAiOauth")) {
-        a.accessToken = GetStr(entry, L"accessToken");
-        a.expiresMs = (ULONGLONG)GetNum(entry, L"expiresAt", 0);
-        a.ok = !a.accessToken.empty();
-        if (!a.ok) a.err = L"no access token";
-        return a;
+    if ((acc.authSource == L"claude-code" || legacyAutoSource) && acc.provider == L"anthropic") {
+        if (auto entry = GetObj(root, L"claudeAiOauth")) {
+            a.accessToken = GetStr(entry, L"accessToken");
+            a.expiresMs = (ULONGLONG)GetNum(entry, L"expiresAt", 0);
+            a.ok = !a.accessToken.empty();
+            if (!a.ok) a.err = L"no access token";
+            return a;
+        }
+        if (!legacyAutoSource) {
+            a.err = L"no Claude Code credentials found";
+            return a;
+        }
     }
 
-    if (auto entry = GetObj(root, L"tokens")) {
-        a.accessToken = GetStr(entry, L"access_token");
-        a.accountId = GetStr(entry, L"account_id");
-        a.ok = !a.accessToken.empty();
-        if (!a.ok) a.err = L"no access token";
-        return a;
+    if ((acc.authSource == L"codex" || legacyAutoSource) && acc.provider == L"openai") {
+        if (auto entry = GetObj(root, L"tokens")) {
+            a.accessToken = GetStr(entry, L"access_token");
+            a.accountId = GetStr(entry, L"account_id");
+            a.ok = !a.accessToken.empty();
+            if (!a.ok) a.err = L"no access token";
+            return a;
+        }
+        if (!legacyAutoSource) {
+            a.err = L"no Codex credentials found";
+            return a;
+        }
     }
 
     a.err = L"no credentials found";
@@ -811,10 +838,12 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
             FetchAccount(accounts[i], &results[i], &retryAfter);
             if (!results[i].error.empty()) {
                 anyError = true;
-                std::wstring errorState = accounts[i].provider + L"\n" + accounts[i].authFile + L"\n" +
-                                          accounts[i].authKey + L"\n" + results[i].error;
+                std::wstring errorState = accounts[i].provider + L"\n" + accounts[i].authSource + L"\n" +
+                                          accounts[i].authFile + L"\n" + accounts[i].authKey + L"\n" +
+                                          results[i].error;
                 if (errorState != lastLoggedErrorStates[i]) {
-                    Wh_Log(L"Fetch [%d] %s: %s", (int)i, accounts[i].provider.c_str(), results[i].error.c_str());
+                    Wh_Log(L"Fetch [%d] %s/%s: %s", (int)i, accounts[i].provider.c_str(),
+                           accounts[i].authSource.c_str(), results[i].error.c_str());
                     lastLoggedErrorStates[i] = std::move(errorState);
                 }
             } else {
@@ -1184,8 +1213,11 @@ static void UpdateQuotaUi() {
                 }
             }
 
+            std::wstring sourceName = accounts[i].authSource == L"claude-code" ? L"Claude Code" :
+                                      accounts[i].authSource == L"codex" ? L"Codex" : L"OpenCode";
             std::wstring tip = (warn ? L"! " : L"") + accounts[i].label + L" - " +
-                               (accounts[i].provider == L"anthropic" ? L"Anthropic" : L"OpenAI");
+                               (accounts[i].provider == L"anthropic" ? L"Anthropic" : L"OpenAI") +
+                               L" (" + sourceName + L")";
             bool planIsSpark = d.plan.find(L"Spark") != std::wstring::npos ||
                                d.plan.find(L"spark") != std::wstring::npos;
             if (!d.plan.empty() && (showCodexSparkInTooltip || !planIsSpark)) {
@@ -1452,6 +1484,12 @@ static bool HookTaskbarDllSymbols() {
 
 static void LoadSettings() {
     Settings s;
+    auto defaultAuthFile = [](const std::wstring& authSource) {
+        if (authSource == L"claude-code") return ExpandEnv(kDefaultClaudeCodeAuthFile);
+        if (authSource == L"codex") return ExpandEnv(kDefaultCodexAuthFile);
+        return ExpandEnv(kDefaultOpenCodeAuthFile);
+    };
+
     for (int i = 0;; i++) {
         PCWSTR provider = Wh_GetStringSetting(L"accounts[%d].provider", i);
         if (!*provider) {
@@ -1460,8 +1498,26 @@ static void LoadSettings() {
         }
 
         AccountConfig a;
-        a.provider = provider;
+        std::wstring providerSetting = provider;
         Wh_FreeStringSetting(provider);
+
+        if (providerSetting == L"anthropic-claude-code") {
+            a.provider = L"anthropic";
+            a.authSource = L"claude-code";
+        } else if (providerSetting == L"openai-codex") {
+            a.provider = L"openai";
+            a.authSource = L"codex";
+        } else if (providerSetting == L"openai-opencode") {
+            a.provider = L"openai";
+            a.authSource = L"opencode";
+        } else if (providerSetting == L"anthropic-opencode") {
+            a.provider = L"anthropic";
+            a.authSource = L"opencode";
+        } else {
+            // Existing configs used bare anthropic/openai and auto-detected the file shape.
+            a.provider = providerSetting.find(L"openai") != std::wstring::npos ? L"openai" : L"anthropic";
+            a.authSource = L"auto";
+        }
 
         PCWSTR label = Wh_GetStringSetting(L"accounts[%d].label", i);
         a.label = label;
@@ -1470,7 +1526,11 @@ static void LoadSettings() {
         PCWSTR authFile = Wh_GetStringSetting(L"accounts[%d].authFile", i);
         a.authFile = ExpandEnv(authFile);
         Wh_FreeStringSetting(authFile);
-        if (a.authFile.empty()) a.authFile = ExpandEnv(kDefaultAuthFile);
+        if (a.authFile.empty() ||
+            ((a.authSource == L"claude-code" || a.authSource == L"codex") &&
+             a.authFile == ExpandEnv(kDefaultOpenCodeAuthFile))) {
+            a.authFile = defaultAuthFile(a.authSource);
+        }
 
         PCWSTR authKey = Wh_GetStringSetting(L"accounts[%d].authKey", i);
         a.authKey = authKey;
@@ -1481,9 +1541,9 @@ static void LoadSettings() {
     }
 
     if (s.accounts.empty()) {
-        std::wstring authFile = ExpandEnv(kDefaultAuthFile);
-        s.accounts.push_back({L"anthropic", L"A", authFile, L""});
-        s.accounts.push_back({L"openai", L"O", authFile, L""});
+        std::wstring authFile = ExpandEnv(kDefaultOpenCodeAuthFile);
+        s.accounts.push_back({L"anthropic", L"opencode", L"A", authFile, L""});
+        s.accounts.push_back({L"openai", L"opencode", L"O", authFile, L""});
     }
 
     int pollMinutes = Wh_GetIntSetting(L"pollIntervalMinutes");
