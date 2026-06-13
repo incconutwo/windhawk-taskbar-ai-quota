@@ -313,6 +313,8 @@ static const wchar_t* kRootName = L"AiQuota_Root";
 static const wchar_t* kDefaultOpenCodeAuthFile = L"%USERPROFILE%\\.local\\share\\opencode\\auth.json";
 static const wchar_t* kDefaultClaudeCodeAuthFile = L"%USERPROFILE%\\.claude\\.credentials.json";
 static const wchar_t* kDefaultCodexAuthFile = L"%USERPROFILE%\\.codex\\auth.json";
+static constexpr ULONGLONG kFileTimeUnixEpochOffsetMs = 11644473600000ULL;
+static constexpr ULONGLONG kUnixTimestampMsThreshold = 100000000000ULL;
 
 using WindowThreadProc = bool (*)(void*);
 static bool RunFromWindowThread(HWND hWnd, WindowThreadProc proc, void* param, DWORD timeoutMs = 2000);
@@ -329,7 +331,7 @@ static ULONGLONG NowUnixMs() {
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
     ULONGLONG t = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
-    return t / 10000 - 11644473600000ULL;
+    return t / 10000 - kFileTimeUnixEpochOffsetMs;
 }
 
 static std::wstring Utf8ToWide(const std::string& s) {
@@ -397,7 +399,7 @@ static ULONGLONG ParseIso8601Ms(const std::wstring& s) {
     FILETIME ft;
     if (!SystemTimeToFileTime(&st, &ft)) return 0;
     ULONGLONG t = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
-    ULONGLONG unixMs = t / 10000 - 11644473600000ULL;
+    ULONGLONG unixMs = t / 10000 - kFileTimeUnixEpochOffsetMs;
 
     size_t tpos = s.find(L'T');
     size_t sign = tpos == std::wstring::npos ? std::wstring::npos : s.find_first_of(L"+-", tpos);
@@ -429,7 +431,7 @@ static ULONGLONG ParseIso8601Ms(const std::wstring& s) {
 static bool UnixMsToLocalSystemTime(ULONGLONG unixMs, SYSTEMTIME* local) {
     if (!unixMs || !local) return false;
 
-    ULONGLONG t = (unixMs + 11644473600000ULL) * 10000;
+    ULONGLONG t = (unixMs + kFileTimeUnixEpochOffsetMs) * 10000;
     FILETIME ft{(DWORD)(t & 0xFFFFFFFF), (DWORD)(t >> 32)};
     SYSTEMTIME utc;
     return FileTimeToSystemTime(&ft, &utc) &&
@@ -574,7 +576,7 @@ static ULONGLONG GetExpiryMs(JsonObject const& o) {
     if (expiry <= 0) expiry = GetNum(o, L"expires_at", 0);
     if (expiry > 0) {
         ULONGLONG expiryMs = (ULONGLONG)expiry;
-        return expiryMs < 100000000000ULL ? expiryMs * 1000 : expiryMs;
+        return expiryMs < kUnixTimestampMsThreshold ? expiryMs * 1000 : expiryMs;
     }
 
     std::wstring expiryText = GetStr(o, L"expires");
@@ -773,8 +775,8 @@ static HttpResult HttpGet(PCWSTR host, PCWSTR path, PCWSTR userAgent,
                 if (WinHttpTimeToSystemTime(ra, &st) && SystemTimeToFileTime(&st, &ft)) {
                     ULONGLONG t = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
                     ULONGLONG fileMs = t / 10000;
-                    if (fileMs > 11644473600000ULL) {
-                        ULONGLONG retryUnixMs = fileMs - 11644473600000ULL;
+                    if (fileMs > kFileTimeUnixEpochOffsetMs) {
+                        ULONGLONG retryUnixMs = fileMs - kFileTimeUnixEpochOffsetMs;
                         ULONGLONG now = NowUnixMs();
                         if (retryUnixMs > now) {
                             ULONGLONG deltaSec = (retryUnixMs - now + 999) / 1000;
@@ -888,7 +890,7 @@ static bool ParseOpenAiUsage(const std::string& body, AccountData* d, std::wstri
             if (resetAt > 0) return (ULONGLONG)resetAt;
 
             resetAt = GetNum(window, L"reset_at", 0);
-            if (resetAt > 100000000000.0) return (ULONGLONG)resetAt;
+            if (resetAt > (double)kUnixTimestampMsThreshold) return (ULONGLONG)resetAt;
             if (resetAt > 0) return (ULONGLONG)(resetAt * 1000);
 
             double resetAfter = GetNum(window, L"reset_after_seconds", 0);
