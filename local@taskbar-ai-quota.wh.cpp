@@ -20,7 +20,7 @@ Each account gets one narrow column:
 - top bar: 5-hour usage
 - bottom bar: weekly usage
 
-Bars go green to red as usage approaches the limit, and gray when stale.
+Bars use green/yellow/orange/red threshold colors, and gray when stale.
 Hover for exact percentages/reset times. Click a column to refresh.
 
 Credentials are read-only. The mod never refreshes or rewrites tokens.
@@ -73,6 +73,15 @@ Default source: `%USERPROFILE%\.local\share\opencode\auth.json`.
 - showPercentText: false
   $name: Show percent text
   $description: 'Default: false. Shows compact 5h/week percentages over the bars.'
+- yellowThreshold: 50
+  $name: Yellow threshold (%)
+  $description: 'Default: 50. Usage below this stays green.'
+- orangeThreshold: 75
+  $name: Orange threshold (%)
+  $description: 'Default: 75. Usage below this stays yellow.'
+- redThreshold: 90
+  $name: Red threshold (%)
+  $description: 'Default: 90. Usage at or above this turns red.'
 */
 // ==/WindhawkModSettings==
 
@@ -131,6 +140,9 @@ struct Settings {
     int barWidth = 100;
     int barHeight = 8;
     int labelFontSize = 11;
+    int yellowThreshold = 50;
+    int orangeThreshold = 75;
+    int redThreshold = 90;
     bool showLabels = true;
     bool labelOnLeft = true;
     bool showPercentText = false;
@@ -322,26 +334,14 @@ static std::wstring FormatUpdated(ULONGLONG unixMs, bool stale) {
     return buf;
 }
 
-static winrt::Windows::UI::Color UsageColor(double pct, bool stale) {
+static winrt::Windows::UI::Color UsageColor(double pct, bool stale, int yellowThreshold,
+                                            int orangeThreshold, int redThreshold) {
     if (stale || pct < 0) return {255, 0x9E, 0x9E, 0x9E};
 
-    double t = std::clamp(pct / 100.0, 0.0, 1.0);
-    double h = 120.0 * (1.0 - t), s = 0.85, v = 0.90;
-    double c = v * s;
-    double x = c * (1.0 - std::fabs(std::fmod(h / 60.0, 2.0) - 1.0));
-    double m = v - c;
-    double r = 0, g = 0, b = 0;
-    if (h < 60) {
-        r = c;
-        g = x;
-    } else if (h < 120) {
-        r = x;
-        g = c;
-    } else {
-        g = c;
-        b = x;
-    }
-    return {255, (BYTE)((r + m) * 255), (BYTE)((g + m) * 255), (BYTE)((b + m) * 255)};
+    if (pct >= redThreshold) return {255, 0xE5, 0x39, 0x35};
+    if (pct >= orangeThreshold) return {255, 0xFB, 0x8C, 0x00};
+    if (pct >= yellowThreshold) return {255, 0xFD, 0xD8, 0x35};
+    return {255, 0x43, 0xA0, 0x47};
 }
 
 /**********************************************/
@@ -1138,13 +1138,16 @@ static void UpdateQuotaUi() {
     if (!g_quotaGrid) return;
 
     std::vector<AccountConfig> accounts;
-    int intervalMin, barWidth;
+    int intervalMin, barWidth, yellowThreshold, orangeThreshold, redThreshold;
     bool showPercentText;
     {
         std::lock_guard<std::mutex> lk(g_settingsMutex);
         accounts = g_settings.accounts;
         intervalMin = g_settings.pollMinutes;
         barWidth = g_settings.barWidth;
+        yellowThreshold = g_settings.yellowThreshold;
+        orangeThreshold = g_settings.orangeThreshold;
+        redThreshold = g_settings.redThreshold;
         showPercentText = g_settings.showPercentText;
     }
 
@@ -1168,7 +1171,7 @@ static void UpdateQuotaUi() {
             for (int w = 0; w < 2; w++) {
                 const WindowUsage& wu = w == 0 ? d.win5h : d.winWeek;
                 int px = wu.pct > 0 ? std::clamp((int)std::lround(barWidth * wu.pct / 100.0), 2, barWidth) : 0;
-                auto c = UsageColor(wu.pct, stale);
+                auto c = UsageColor(wu.pct, stale, yellowThreshold, orangeThreshold, redThreshold);
                 uint32_t cv = ((uint32_t)c.A << 24) | ((uint32_t)c.R << 16) |
                               ((uint32_t)c.G << 8) | c.B;
                 if (px != ap.fillPx[w] || cv != ap.fillColor[w]) {
@@ -1468,10 +1471,16 @@ static void LoadSettings() {
     int barWidth = Wh_GetIntSetting(L"barWidth");
     int barHeight = Wh_GetIntSetting(L"barHeight");
     int labelFontSize = Wh_GetIntSetting(L"labelFontSize");
+    int yellowThreshold = Wh_GetIntSetting(L"yellowThreshold");
+    int orangeThreshold = Wh_GetIntSetting(L"orangeThreshold");
+    int redThreshold = Wh_GetIntSetting(L"redThreshold");
     s.pollMinutes = std::clamp(pollMinutes > 0 ? pollMinutes : 10, 2, 24 * 60);
     s.barWidth = std::clamp(barWidth > 0 ? barWidth : 100, 10, 100);
     s.barHeight = std::clamp(barHeight > 0 ? barHeight : 8, 2, 20);
     s.labelFontSize = std::clamp(labelFontSize > 0 ? labelFontSize : 11, 6, 24);
+    s.yellowThreshold = std::clamp(yellowThreshold > 0 ? yellowThreshold : 50, 0, 100);
+    s.orangeThreshold = std::clamp(orangeThreshold > 0 ? orangeThreshold : 75, s.yellowThreshold, 100);
+    s.redThreshold = std::clamp(redThreshold > 0 ? redThreshold : 90, s.orangeThreshold, 100);
     s.showLabels = Wh_GetIntSetting(L"showLabels") != 0;
     s.labelOnLeft = Wh_GetIntSetting(L"labelOnLeft") != 0;
     s.showPercentText = Wh_GetIntSetting(L"showPercentText") != 0;
