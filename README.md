@@ -10,7 +10,7 @@ Can show on the primary taskbar only, all taskbars, or one specific monitor.
 Each configured account gets one compact taskbar column:
 
 - stacked layout: top bar = 5-hour usage, bottom bar = weekly usage
-- horizontal layout: left bar = 5-hour usage, right bar = weekly usage
+- vertical layout: side-by-side 5h | weekly bars, both filling bottom-up
 
 Hover for exact percentages and reset times. Click a column to refresh that account or open the provider dashboard, depending on settings. Right-click a column for Refresh all and Open dashboard.
 

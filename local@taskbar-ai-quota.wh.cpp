@@ -2,7 +2,7 @@
 // @id              taskbar-ai-quota
 // @name            Taskbar AI Quota Bars
 // @description     Shows compact 5-hour and weekly AI agent/LLM subscription quota bars for Anthropic and OpenAI on the Windows 11 taskbar
-// @version         0.7.1
+// @version         0.8.0
 // @author          Cleroth
 // @include         explorer.exe
 // @architecture    x86-64
@@ -20,8 +20,8 @@ Can show on the primary taskbar only, all taskbars, or one specific monitor.
 ![Taskbar AI Quota Bars](https://i.imgur.com/AsaacYF.png)
 
 Each account gets one compact column:
-- stacked layout: top bar = 5-hour usage, bottom bar = weekly usage
-- horizontal layout: left bar = 5-hour usage, right bar = weekly usage
+- stacked layout: stacked horizontal bars, filling left-to-right
+- vertical layout: side-by-side bars, filling bottom-up
 
 Hover for exact percentages and reset times. Click a column to refresh that account
 or open the provider dashboard, depending on settings. Right-click for Refresh all
@@ -90,16 +90,16 @@ own auth files if requests start returning `401`.
   $description: 'Default: 10'
 - barLength: 100
   $name: Bar length (px)
-  $description: 'Default: 100. Minimum: 10'
+  $description: 'Default: 100. Minimum: 10. Width for stacked bars, height for vertical bars.'
 - barThickness: 8
   $name: Bar thickness (px)
-  $description: 'Default: 8'
+  $description: 'Default: 8. Height for stacked bars, width for vertical bars.'
 - barLayout: stacked
   $name: Bar layout
-  $description: 'Default: Stacked. Choose vertical stacked bars or side-by-side bars.'
+  $description: 'Default: Stacked. Choose stacked left-to-right bars or vertical bottom-up bars.'
   $options:
-    - stacked: Stacked (5h above weekly)
-    - horizontal: Horizontal (5h | weekly)
+    - stacked: Stacked Horizontal
+    - vertical: Vertical
 - showLabels: true
   $name: Show labels
   $description: 'Default: true'
@@ -212,7 +212,7 @@ enum class ClickAction {
 
 enum class BarLayout {
     Stacked,
-    Horizontal,
+    Vertical,
 };
 
 struct Settings {
@@ -1617,7 +1617,7 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
         state.accountRefs.clear();
         if (accounts.empty()) return nullptr;
         state.accountRefs.reserve(accounts.size());
-        bool horizontalBars = barLayout == BarLayout::Horizontal;
+        bool verticalBars = barLayout == BarLayout::Vertical;
 
         Grid root;
         root.Name(kRootName);
@@ -1655,27 +1655,28 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
             }
 
             StackPanel bars;
-            bars.Orientation(horizontalBars ? Orientation::Horizontal : Orientation::Vertical);
+            bars.Orientation(verticalBars ? Orientation::Horizontal : Orientation::Vertical);
             bars.VerticalAlignment(VerticalAlignment::Center);
 
             double radius = std::max(1.0, barThickness / 2.0);
             double halfBarGap = barGap / 2.0;
             for (int w = 0; w < 2; w++) {
                 Border track;
-                track.Width(barLength);
-                track.Height(barThickness);
+                track.Width(verticalBars ? barThickness : barLength);
+                track.Height(verticalBars ? barLength : barThickness);
                 track.CornerRadius({radius, radius, radius, radius});
-                track.Margin(horizontalBars ?
-                                 (w == 0 ? Thickness{0, 1, halfBarGap, 1} : Thickness{halfBarGap, 1, 0, 1}) :
+                track.Margin(verticalBars ?
+                                 (w == 0 ? Thickness{0, 0, halfBarGap, 0} : Thickness{halfBarGap, 0, 0, 0}) :
                                  (w == 0 ? Thickness{0, 1, 0, halfBarGap} : Thickness{0, halfBarGap, 0, 1}));
                 track.HorizontalAlignment(HorizontalAlignment::Center);
                 track.Background(SolidColorBrush(winrt::Windows::UI::Color{0x46, 0x80, 0x80, 0x80}));
 
                 Border fill;
-                fill.Height(barThickness);
-                fill.Width(0);
+                fill.Height(verticalBars ? 0 : barThickness);
+                fill.Width(verticalBars ? barThickness : 0);
                 fill.CornerRadius({radius, radius, radius, radius});
-                fill.HorizontalAlignment(HorizontalAlignment::Left);
+                fill.HorizontalAlignment(verticalBars ? HorizontalAlignment::Center : HorizontalAlignment::Left);
+                fill.VerticalAlignment(verticalBars ? VerticalAlignment::Bottom : VerticalAlignment::Center);
                 fill.Background(SolidColorBrush(winrt::Windows::UI::Color{255, 0x9E, 0x9E, 0x9E}));
                 swprintf(name, ARRAYSIZE(name), L"AiQuota_Fill_%d_%d", (int)i, w);
                 fill.Name(name);
@@ -1687,7 +1688,8 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
 
             if (showPercentText) {
                 Grid overlay;
-                overlay.Width(horizontalBars ? barLength * 2.0 + barGap : barLength);
+                overlay.Width(verticalBars ? barThickness * 2.0 + barGap : barLength);
+                if (verticalBars) overlay.Height(barLength);
                 overlay.VerticalAlignment(VerticalAlignment::Center);
                 overlay.Children().Append(bars);
 
@@ -1768,12 +1770,14 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
     std::vector<AccountConfig> accounts;
     int intervalMin, barLength, yellowThreshold, orangeThreshold, redThreshold;
     bool showPercentText, showCodexSparkInTooltip, colorblindMode, showStaleWarning;
+    BarLayout barLayout;
     ClickAction clickAction;
     {
         std::lock_guard<std::mutex> lk(g_settingsMutex);
         accounts = g_settings.accounts;
         intervalMin = g_settings.pollMinutes;
         clickAction = g_settings.clickAction;
+        barLayout = g_settings.barLayout;
         barLength = g_settings.barLength;
         yellowThreshold = g_settings.yellowThreshold;
         orangeThreshold = g_settings.orangeThreshold;
@@ -1796,6 +1800,7 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
     ULONGLONG now = NowUnixMs();
     bool refreshing = g_refreshing.load();
     int refreshAccountIndex = g_refreshAccountIndex.load();
+    bool verticalBars = barLayout == BarLayout::Vertical;
     try {
         for (size_t i = 0; i < data.size(); i++) {
             const AccountData& d = data[i];
@@ -1815,7 +1820,8 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
                               ((uint32_t)c.G << 8) | c.B;
                 if (px != ap.fillPx[w] || cv != ap.fillColor[w]) {
                     if (ui.fills[w]) {
-                        ui.fills[w].Width(px);
+                        if (verticalBars) ui.fills[w].Height(px);
+                        else ui.fills[w].Width(px);
                         ui.fills[w].Background(SolidColorBrush(c));
                     }
                     ap.fillPx[w] = px;
@@ -2332,7 +2338,7 @@ static void LoadSettings() {
     std::wstring clickAction = getSettingText(L"clickAction");
     s.clickAction = clickAction == L"open-dashboard" ? ClickAction::OpenDashboard : ClickAction::Refresh;
     std::wstring barLayout = getSettingText(L"barLayout");
-    s.barLayout = barLayout == L"horizontal" ? BarLayout::Horizontal : BarLayout::Stacked;
+    s.barLayout = barLayout == L"vertical" ? BarLayout::Vertical : BarLayout::Stacked;
     int taskbarMonitorNumber = getIntSetting(L"taskbarMonitorNumber", 1);
 
     s.pollMinutes = std::clamp(pollMinutes > 0 ? pollMinutes : 10, 2, 24 * 60);
