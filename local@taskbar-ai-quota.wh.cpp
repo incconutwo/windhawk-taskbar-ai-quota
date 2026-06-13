@@ -77,7 +77,7 @@ own auth files if requests start returning `401`.
   $description: 'Default: 10'
 - barWidth: 100
   $name: Bar width (px)
-  $description: 'Default: 100'
+  $description: 'Default: 100. Range: 10-300'
 - barHeight: 8
   $name: Bar height (px)
   $description: 'Default: 8'
@@ -242,6 +242,7 @@ static std::mutex g_dataMutex;
 
 static std::atomic<bool> g_unloading{false};
 static std::atomic<bool> g_refreshing{false};
+static std::atomic<ULONGLONG> g_refreshGeneration{0};
 static std::atomic<bool> g_uiInjected{false};
 static std::atomic<bool> g_fetchThreadStarted{false};
 static HANDLE g_stopEvent = nullptr;
@@ -249,6 +250,8 @@ static HANDLE g_refreshEvent = nullptr;
 static HANDLE g_fetchThread = nullptr;
 static HANDLE g_retryThread = nullptr;
 static std::atomic<ULONGLONG> g_nextInjectFailureLogMs{0};
+static std::mutex g_httpHandlesMutex;
+static std::vector<HINTERNET> g_httpHandles;
 
 static std::vector<std::unique_ptr<QuotaUiInstance>> g_uiInstances;
 
@@ -287,7 +290,14 @@ static std::wstring Utf8ToWide(const std::string& s) {
 static std::wstring ExpandEnv(PCWSTR s) {
     wchar_t buf[1024];
     DWORD n = ExpandEnvironmentStringsW(s, buf, ARRAYSIZE(buf));
-    if (n == 0 || n > ARRAYSIZE(buf)) return s;
+    if (n == 0) return s;
+    if (n > ARRAYSIZE(buf)) {
+        std::wstring expanded(n, L'\0');
+        DWORD written = ExpandEnvironmentStringsW(s, expanded.data(), n);
+        if (written == 0 || written > n) return s;
+        expanded.resize(written - 1);
+        return expanded;
+    }
     return buf;
 }
 
@@ -339,9 +349,25 @@ static ULONGLONG ParseIso8601Ms(const std::wstring& s) {
     size_t sign = tpos == std::wstring::npos ? std::wstring::npos : s.find_first_of(L"+-", tpos);
     if (sign != std::wstring::npos) {
         int oh = 0, om = 0;
-        swscanf(s.c_str() + sign + 1, L"%d:%d", &oh, &om);
-        LONGLONG off = ((LONGLONG)oh * 60 + om) * 60000;
-        unixMs = s[sign] == L'+' ? unixMs - off : unixMs + off;
+        PCWSTR p = s.c_str() + sign + 1;
+        size_t end = s.find_first_not_of(L"0123456789:", sign + 1);
+        size_t len = (end == std::wstring::npos ? s.size() : end) - sign - 1;
+        auto digit = [](wchar_t c) { return c >= L'0' && c <= L'9'; };
+        bool parsedOffset = len >= 2 && digit(p[0]) && digit(p[1]);
+        if (parsedOffset) {
+            oh = (p[0] - L'0') * 10 + (p[1] - L'0');
+            if (len == 5 && p[2] == L':' && digit(p[3]) && digit(p[4])) {
+                om = (p[3] - L'0') * 10 + (p[4] - L'0');
+            } else if (len == 4 && digit(p[2]) && digit(p[3])) {
+                om = (p[2] - L'0') * 10 + (p[3] - L'0');
+            } else if (len != 2) {
+                parsedOffset = false;
+            }
+        }
+        if (parsedOffset && oh <= 23 && om <= 59) {
+            LONGLONG off = ((LONGLONG)oh * 60 + om) * 60000;
+            unixMs = s[sign] == L'+' ? unixMs - off : unixMs + off;
+        }
     }
     return unixMs;
 }
@@ -443,6 +469,21 @@ static std::wstring GetStr(JsonObject const& o, PCWSTR name) {
     return std::wstring(s.c_str(), s.size());
 }
 
+static ULONGLONG GetExpiryMs(JsonObject const& o) {
+    double expiry = GetNum(o, L"expires", 0);
+    if (expiry <= 0) expiry = GetNum(o, L"expiresAt", 0);
+    if (expiry <= 0) expiry = GetNum(o, L"expires_at", 0);
+    if (expiry > 0) {
+        ULONGLONG expiryMs = (ULONGLONG)expiry;
+        return expiryMs < 100000000000ULL ? expiryMs * 1000 : expiryMs;
+    }
+
+    std::wstring expiryText = GetStr(o, L"expires");
+    if (expiryText.empty()) expiryText = GetStr(o, L"expiresAt");
+    if (expiryText.empty()) expiryText = GetStr(o, L"expires_at");
+    return expiryText.empty() ? 0 : ParseIso8601Ms(expiryText);
+}
+
 static bool GetBool(JsonObject const& o, PCWSTR name) {
     if (!o || !o.HasKey(name)) return false;
     auto v = o.GetNamedValue(name);
@@ -507,7 +548,7 @@ static AuthInfo LoadAuthInfo(const AccountConfig& acc) {
         if (auto entry = GetObj(root, key.c_str())) {
             a.accessToken = GetStr(entry, L"access");
             a.accountId = GetStr(entry, L"accountId");
-            a.expiresMs = (ULONGLONG)GetNum(entry, L"expires", 0);
+            a.expiresMs = GetExpiryMs(entry);
             a.ok = !a.accessToken.empty();
             if (!a.ok) a.err = L"no access token";
             if (a.ok || !legacyAutoSource) return a;
@@ -521,7 +562,7 @@ static AuthInfo LoadAuthInfo(const AccountConfig& acc) {
     if ((acc.authSource == L"claude-code" || legacyAutoSource) && acc.provider == L"anthropic") {
         if (auto entry = GetObj(root, L"claudeAiOauth")) {
             a.accessToken = GetStr(entry, L"accessToken");
-            a.expiresMs = (ULONGLONG)GetNum(entry, L"expiresAt", 0);
+            a.expiresMs = GetExpiryMs(entry);
             a.ok = !a.accessToken.empty();
             if (!a.ok) a.err = L"no access token";
             return a;
@@ -536,6 +577,7 @@ static AuthInfo LoadAuthInfo(const AccountConfig& acc) {
         if (auto entry = GetObj(root, L"tokens")) {
             a.accessToken = GetStr(entry, L"access_token");
             a.accountId = GetStr(entry, L"account_id");
+            a.expiresMs = GetExpiryMs(entry);
             a.ok = !a.accessToken.empty();
             if (!a.ok) a.err = L"no access token";
             return a;
@@ -561,26 +603,57 @@ struct HttpResult {
     std::string body;
 };
 
+static bool TrackHttpHandle(HINTERNET h) {
+    if (!h) return false;
+    std::lock_guard<std::mutex> lk(g_httpHandlesMutex);
+    if (g_unloading) {
+        WinHttpCloseHandle(h);
+        return false;
+    }
+    g_httpHandles.push_back(h);
+    return true;
+}
+
+static bool UntrackHttpHandle(HINTERNET h) {
+    std::lock_guard<std::mutex> lk(g_httpHandlesMutex);
+    auto it = std::find(g_httpHandles.begin(), g_httpHandles.end(), h);
+    if (it == g_httpHandles.end()) return false;
+    g_httpHandles.erase(it);
+    return true;
+}
+
+static void CloseActiveHttpHandles() {
+    std::vector<HINTERNET> handles;
+    {
+        std::lock_guard<std::mutex> lk(g_httpHandlesMutex);
+        handles.swap(g_httpHandles);
+    }
+    for (auto it = handles.rbegin(); it != handles.rend(); ++it) WinHttpCloseHandle(*it);
+}
+
 static HttpResult HttpGet(PCWSTR host, PCWSTR path, PCWSTR userAgent,
                           const std::wstring& headers) {
     HttpResult res;
     HINTERNET ses = WinHttpOpen(userAgent, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS,
                                 0);
+    if (ses && !TrackHttpHandle(ses)) ses = nullptr;
     HINTERNET con = nullptr;
     HINTERNET req = nullptr;
 
-    if (ses) {
+    if (ses && !g_unloading) {
         WinHttpSetTimeouts(ses, 5000, 5000, 5000, 10000);
         con = WinHttpConnect(ses, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+        if (con && !TrackHttpHandle(con)) con = nullptr;
         req = con ? WinHttpOpenRequest(con, L"GET", path, nullptr,
-                                       WINHTTP_NO_REFERER,
-                                       WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                       WINHTTP_FLAG_SECURE)
+                                        WINHTTP_NO_REFERER,
+                                        WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                        WINHTTP_FLAG_SECURE)
                   : nullptr;
+        if (req && !TrackHttpHandle(req)) req = nullptr;
     }
 
-    if (req && WinHttpSendRequest(req, headers.c_str(), (DWORD)headers.size(),
+    if (!g_unloading && req && WinHttpSendRequest(req, headers.c_str(), (DWORD)headers.size(),
                                   WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
         WinHttpReceiveResponse(req, nullptr)) {
         DWORD status = 0, sz = sizeof(status);
@@ -636,9 +709,9 @@ static HttpResult HttpGet(PCWSTR host, PCWSTR path, PCWSTR userAgent,
         res.ok = bodyOk;
     }
 
-    if (req) WinHttpCloseHandle(req);
-    if (con) WinHttpCloseHandle(con);
-    if (ses) WinHttpCloseHandle(ses);
+    if (req && UntrackHttpHandle(req)) WinHttpCloseHandle(req);
+    if (con && UntrackHttpHandle(con)) WinHttpCloseHandle(con);
+    if (ses && UntrackHttpHandle(ses)) WinHttpCloseHandle(ses);
     return res;
 }
 
@@ -891,12 +964,17 @@ static void PostUiUpdate() {
 }
 
 static DWORD WINAPI FetchThreadProc(LPVOID) {
-    try { winrt::init_apartment(winrt::apartment_type::multi_threaded); } catch (...) {}
+    bool apartmentInitialized = false;
+    try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        apartmentInitialized = true;
+    } catch (...) {}
 
     std::vector<std::wstring> lastLoggedErrorStates;
     std::vector<ULONGLONG> retryDeadlineMs;
     ULONGLONG lastLoggedSettingsGeneration = 0;
     while (!g_unloading) {
+        ULONGLONG refreshGeneration = g_refreshGeneration.load();
         std::vector<AccountConfig> accounts;
         int intervalMin;
         ULONGLONG settingsGeneration;
@@ -967,7 +1045,7 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
                 }
             }
         }
-        g_refreshing = false;
+        if (refreshGeneration == g_refreshGeneration.load()) g_refreshing = false;
         if (published) PostUiUpdate();
 
         DWORD waitMs = (DWORD)intervalMin * 60000;
@@ -980,6 +1058,7 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
         HANDLE handles[2] = {g_stopEvent, g_refreshEvent};
         if (WaitForMultipleObjects(2, handles, FALSE, waitMs) == WAIT_OBJECT_0) break;
     }
+    if (apartmentInitialized) winrt::uninit_apartment();
     return 0;
 }
 
@@ -1025,7 +1104,13 @@ static bool RunFromWindowThread(HWND hWnd, WindowThreadProc proc, void* param) {
     if (!hook) return false;
 
     Payload pay{proc, param};
-    SendMessageW(hWnd, kMsg, 0, reinterpret_cast<LPARAM>(&pay));
+    DWORD_PTR ignored = 0;
+    // Avoid worker/UI deadlocks during unload if the target thread stops pumping messages.
+    if (!SendMessageTimeoutW(hWnd, kMsg, 0, reinterpret_cast<LPARAM>(&pay),
+                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 2000, &ignored)) {
+        UnhookWindowsHookEx(hook);
+        return false;
+    }
     UnhookWindowsHookEx(hook);
     return true;
 }
@@ -1347,6 +1432,7 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
                     }
 
                     g_refreshing = true;
+                    g_refreshGeneration++;
                     PostUiUpdate();
                     if (g_refreshEvent) SetEvent(g_refreshEvent);
                     e.Handled(true);
@@ -1875,13 +1961,26 @@ static void LoadSettings() {
         s.accounts.push_back({L"openai", L"opencode", L"O", authFile, L""});
     }
 
-    int pollMinutes = Wh_GetIntSetting(L"pollIntervalMinutes");
-    int barWidth = Wh_GetIntSetting(L"barWidth");
-    int barHeight = Wh_GetIntSetting(L"barHeight");
-    int labelFontSize = Wh_GetIntSetting(L"labelFontSize");
-    int yellowThreshold = Wh_GetIntSetting(L"yellowThreshold");
-    int orangeThreshold = Wh_GetIntSetting(L"orangeThreshold");
-    int redThreshold = Wh_GetIntSetting(L"redThreshold");
+    auto hasSetting = [](PCWSTR name) {
+        PCWSTR text = Wh_GetStringSetting(name);
+        bool hasValue = *text != L'\0';
+        Wh_FreeStringSetting(text);
+        return hasValue;
+    };
+    auto getIntSetting = [&](PCWSTR name, int defaultValue) {
+        return hasSetting(name) ? Wh_GetIntSetting(name) : defaultValue;
+    };
+    auto getBoolSetting = [&](PCWSTR name, bool defaultValue) {
+        return hasSetting(name) ? Wh_GetIntSetting(name) != 0 : defaultValue;
+    };
+
+    int pollMinutes = getIntSetting(L"pollIntervalMinutes", 10);
+    int barWidth = getIntSetting(L"barWidth", 100);
+    int barHeight = getIntSetting(L"barHeight", 8);
+    int labelFontSize = getIntSetting(L"labelFontSize", 11);
+    int yellowThreshold = getIntSetting(L"yellowThreshold", 50);
+    int orangeThreshold = getIntSetting(L"orangeThreshold", 75);
+    int redThreshold = getIntSetting(L"redThreshold", 90);
 
     PCWSTR taskbarMonitorModeText = Wh_GetStringSetting(L"taskbarMonitorMode");
     std::wstring taskbarMonitorMode = taskbarMonitorModeText;
@@ -1893,33 +1992,22 @@ static void LoadSettings() {
     } else {
         s.taskbarMonitorMode = TaskbarMonitorMode::Primary;
     }
-    int taskbarMonitorNumber = Wh_GetIntSetting(L"taskbarMonitorNumber");
-
-    // Older configs do not have threshold keys; Windhawk reports missing ints as 0.
-    if (yellowThreshold == 0 && orangeThreshold == 0 && redThreshold == 0) {
-        yellowThreshold = 50;
-        orangeThreshold = 75;
-        redThreshold = 90;
-    }
+    int taskbarMonitorNumber = getIntSetting(L"taskbarMonitorNumber", 1);
 
     s.pollMinutes = std::clamp(pollMinutes > 0 ? pollMinutes : 10, 2, 24 * 60);
     s.taskbarMonitorNumber = std::clamp(taskbarMonitorNumber > 0 ? taskbarMonitorNumber : 1, 1, 64);
-    s.barWidth = std::clamp(barWidth > 0 ? barWidth : 100, 10, 100);
+    s.barWidth = std::clamp(barWidth > 0 ? barWidth : 100, 10, 300);
     s.barHeight = std::clamp(barHeight > 0 ? barHeight : 8, 2, 20);
     s.labelFontSize = std::clamp(labelFontSize > 0 ? labelFontSize : 11, 6, 24);
     s.yellowThreshold = std::clamp(yellowThreshold, 0, 100);
     s.orangeThreshold = std::clamp(orangeThreshold, s.yellowThreshold, 100);
     s.redThreshold = std::clamp(redThreshold, s.orangeThreshold, 100);
-    s.showLabels = Wh_GetIntSetting(L"showLabels") != 0;
-    s.labelOnLeft = Wh_GetIntSetting(L"labelOnLeft") != 0;
-    s.showPercentText = Wh_GetIntSetting(L"showPercentText") != 0;
-    s.showCodexSparkInTooltip = Wh_GetIntSetting(L"showCodexSparkInTooltip") != 0;
-    s.colorblindMode = Wh_GetIntSetting(L"colorblindMode") != 0;
-
-    PCWSTR showStaleWarningText = Wh_GetStringSetting(L"showStaleWarning");
-    bool hasShowStaleWarning = *showStaleWarningText != L'\0';
-    Wh_FreeStringSetting(showStaleWarningText);
-    s.showStaleWarning = !hasShowStaleWarning || Wh_GetIntSetting(L"showStaleWarning") != 0;
+    s.showLabels = getBoolSetting(L"showLabels", true);
+    s.labelOnLeft = getBoolSetting(L"labelOnLeft", true);
+    s.showPercentText = getBoolSetting(L"showPercentText", false);
+    s.showCodexSparkInTooltip = getBoolSetting(L"showCodexSparkInTooltip", false);
+    s.colorblindMode = getBoolSetting(L"colorblindMode", false);
+    s.showStaleWarning = getBoolSetting(L"showStaleWarning", true);
 
     {
         std::lock_guard<std::mutex> lk(g_settingsMutex);
@@ -1938,6 +2026,7 @@ BOOL Wh_ModInit() {
     Wh_Log(L"Init");
     g_unloading = false;
     g_refreshing = false;
+    g_refreshGeneration = 0;
     g_uiInjected.store(false, std::memory_order_release);
     g_fetchThreadStarted.store(false, std::memory_order_release);
     LoadSettings();
@@ -1979,6 +2068,7 @@ void Wh_ModUninit() {
     g_unloading = true;
     g_uiInjected.store(false, std::memory_order_release);
     if (g_stopEvent) SetEvent(g_stopEvent);
+    CloseActiveHttpHandles();
 
     if (g_retryThread) {
         WaitForSingleObject(g_retryThread, INFINITE);
@@ -2004,6 +2094,7 @@ void Wh_ModUninit() {
 void Wh_ModSettingsChanged() {
     Wh_Log(L"SettingsChanged");
     LoadSettings();
+    g_refreshGeneration++;
 
     RemoveAllQuotaGrids();
     StartRetryInject();
