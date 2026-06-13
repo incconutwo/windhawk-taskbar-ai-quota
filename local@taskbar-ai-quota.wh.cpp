@@ -3,7 +3,7 @@
 // @name            Taskbar AI Quota Bars
 // @description     Shows Anthropic and OpenAI quota usage as compact bars on the Windows 11 taskbar, left of the system tray
 // @version         0.1
-// @author          clero
+// @author          Cleroth
 // @include         explorer.exe
 // @architecture    x86-64
 // @compilerOptions -lole32 -loleaut32 -lruntimeobject -lwindowsapp -lwinhttp -luser32
