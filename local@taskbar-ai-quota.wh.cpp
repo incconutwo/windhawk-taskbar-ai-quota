@@ -21,7 +21,7 @@ Each account gets one narrow column:
 - top bar: 5-hour usage
 - bottom bar: weekly usage
 
-Hover for exact percentages and reset times. Click a column to refresh.
+Hover for exact percentages and reset times. Click a column to refresh that account.
 Bars use configurable green/yellow/orange/red thresholds, with a colorblind palette option.
 Stale errors can mark labels/tooltips with `!`.
 
@@ -242,6 +242,7 @@ static std::mutex g_dataMutex;
 
 static std::atomic<bool> g_unloading{false};
 static std::atomic<bool> g_refreshing{false};
+static std::atomic<int> g_refreshAccountIndex{-1};
 static std::atomic<ULONGLONG> g_refreshGeneration{0};
 static std::atomic<bool> g_uiInjected{false};
 static std::atomic<bool> g_fetchThreadStarted{false};
@@ -975,6 +976,7 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
     ULONGLONG lastLoggedSettingsGeneration = 0;
     while (!g_unloading) {
         ULONGLONG refreshGeneration = g_refreshGeneration.load();
+        int refreshAccountIndex = g_refreshAccountIndex.load();
         std::vector<AccountConfig> accounts;
         int intervalMin;
         ULONGLONG settingsGeneration;
@@ -997,10 +999,20 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
             if (g_data.size() == results.size()) results = g_data;
         }
 
+        bool refreshSingleAccount = g_refreshing.load() && refreshAccountIndex >= 0 &&
+                                    refreshAccountIndex < (int)accounts.size();
         ULONGLONG nextRetryMs = 0;
         bool anyError = false;
         for (size_t i = 0; i < accounts.size() && !g_unloading; i++) {
             ULONGLONG nowMs = NowUnixMs();
+            if (refreshSingleAccount && (int)i != refreshAccountIndex) {
+                if (retryDeadlineMs[i] > nowMs &&
+                    (nextRetryMs == 0 || retryDeadlineMs[i] < nextRetryMs)) {
+                    nextRetryMs = retryDeadlineMs[i];
+                }
+                continue;
+            }
+
             if (retryDeadlineMs[i] > nowMs) {
                 if (nextRetryMs == 0 || retryDeadlineMs[i] < nextRetryMs) {
                     nextRetryMs = retryDeadlineMs[i];
@@ -1045,7 +1057,10 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
                 }
             }
         }
-        if (refreshGeneration == g_refreshGeneration.load()) g_refreshing = false;
+        if (refreshGeneration == g_refreshGeneration.load()) {
+            g_refreshing = false;
+            g_refreshAccountIndex = -1;
+        }
         if (published) PostUiUpdate();
 
         DWORD waitMs = (DWORD)intervalMin * 60000;
@@ -1417,8 +1432,10 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
             ToolTipService::SetPlacement(col, wuxcp::PlacementMode::Top);
             UIElement tappedElement = col.as<UIElement>();
             QuotaUiInstance* statePtr = &state;
+            int accountIndex = (int)i;
             auto tappedToken = tappedElement.Tapped(
-                [statePtr](winrt::Windows::Foundation::IInspectable const&, wuxi::TappedRoutedEventArgs const& e) {
+                [statePtr, accountIndex](winrt::Windows::Foundation::IInspectable const&,
+                                         wuxi::TappedRoutedEventArgs const& e) {
                     if (g_unloading || !statePtr->quotaGrid) {
                         e.Handled(true);
                         return;
@@ -1426,12 +1443,14 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
 
                     if (!g_fetchThreadStarted.load(std::memory_order_acquire)) {
                         g_refreshing = false;
+                        g_refreshAccountIndex = -1;
                         PostUiUpdate();
                         e.Handled(true);
                         return;
                     }
 
                     g_refreshing = true;
+                    g_refreshAccountIndex = accountIndex;
                     g_refreshGeneration++;
                     PostUiUpdate();
                     if (g_refreshEvent) SetEvent(g_refreshEvent);
@@ -1481,6 +1500,7 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
 
     ULONGLONG now = NowUnixMs();
     bool refreshing = g_refreshing.load();
+    int refreshAccountIndex = g_refreshAccountIndex.load();
     wchar_t name[64];
     try {
         for (size_t i = 0; i < data.size(); i++) {
@@ -1489,6 +1509,7 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
             bool stale = d.stale || d.lastSuccessMs == 0 ||
                          now - d.lastSuccessMs > (ULONGLONG)intervalMin * 2 * 60000;
             bool warn = showStaleWarning && stale && !d.error.empty();
+            bool accountRefreshing = refreshing && (refreshAccountIndex < 0 || refreshAccountIndex == (int)i);
 
             for (int w = 0; w < 2; w++) {
                 const WindowUsage& wu = w == 0 ? d.win5h : d.winWeek;
@@ -1541,7 +1562,7 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
             if (!d.extraLines.empty()) tip += L"\n" + d.extraLines;
             if (!d.error.empty()) tip += L"\nerror: " + d.error;
             tip += L"\n" + FormatUpdated(d.lastSuccessMs, stale);
-            tip += refreshing ? L" - refreshing..." : L" - click to refresh";
+            tip += accountRefreshing ? L" - refreshing..." : L" - click to refresh";
 
             if (showPercentText) {
                 std::wstring percentText;
@@ -1571,7 +1592,7 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
                 ap.tip = tip;
             }
 
-            double columnOpacity = refreshing ? 0.65 : 1.0;
+            double columnOpacity = accountRefreshing ? 0.65 : 1.0;
             if (columnOpacity != ap.columnOpacity) {
                 swprintf(name, ARRAYSIZE(name), L"AiQuota_Acc_%d", (int)i);
                 if (auto fe = FindChildByName(state.quotaGrid, name)) fe.Opacity(columnOpacity);
@@ -2026,6 +2047,7 @@ BOOL Wh_ModInit() {
     Wh_Log(L"Init");
     g_unloading = false;
     g_refreshing = false;
+    g_refreshAccountIndex = -1;
     g_refreshGeneration = 0;
     g_uiInjected.store(false, std::memory_order_release);
     g_fetchThreadStarted.store(false, std::memory_order_release);
@@ -2094,6 +2116,7 @@ void Wh_ModUninit() {
 void Wh_ModSettingsChanged() {
     Wh_Log(L"SettingsChanged");
     LoadSettings();
+    g_refreshAccountIndex = -1;
     g_refreshGeneration++;
 
     RemoveAllQuotaGrids();

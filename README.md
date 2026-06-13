@@ -12,7 +12,7 @@ Each configured account gets one compact taskbar column:
 - top bar: 5-hour usage
 - bottom bar: weekly usage
 
-Hover for exact percentages and reset times. Click a column to refresh.
+Hover for exact percentages and reset times. Click a column to refresh that account.
 
 Bars use configurable green/yellow/orange/red thresholds, with an optional colorblind palette. Stale errors can mark labels and tooltips with `!`.
 
