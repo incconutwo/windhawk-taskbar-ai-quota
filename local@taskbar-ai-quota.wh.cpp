@@ -267,21 +267,37 @@ static std::wstring FormatReset(ULONGLONG unixMs) {
     LONGLONG delta = (LONGLONG)(unixMs - NowUnixMs());
     if (delta <= 0) return L"now";
 
+    ULONGLONG totalMin = ((ULONGLONG)delta + 59999) / 60000;
+    ULONGLONG days = totalMin / (24 * 60);
+    ULONGLONG hours = (totalMin / 60) % 24;
+    ULONGLONG mins = totalMin % 60;
+
+    wchar_t rel[64];
+    if (days > 0) {
+        if (hours > 0) swprintf(rel, ARRAYSIZE(rel), L"in %llud %lluh", days, hours);
+        else swprintf(rel, ARRAYSIZE(rel), L"in %llud", days);
+    } else if (hours > 0) {
+        if (mins > 0) swprintf(rel, ARRAYSIZE(rel), L"in %lluh %llum", hours, mins);
+        else swprintf(rel, ARRAYSIZE(rel), L"in %lluh", hours);
+    } else {
+        swprintf(rel, ARRAYSIZE(rel), L"in %llum", mins);
+    }
+
     ULONGLONG t = (unixMs + 11644473600000ULL) * 10000;
     FILETIME ft{(DWORD)(t & 0xFFFFFFFF), (DWORD)(t >> 32)};
     SYSTEMTIME utc, local;
     if (!FileTimeToSystemTime(&ft, &utc) ||
         !SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local)) {
-        return L"?";
+        return rel;
     }
 
     wchar_t buf[64];
     if (delta < 24LL * 3600 * 1000) {
-        swprintf(buf, ARRAYSIZE(buf), L"%02u:%02u", local.wHour, local.wMinute);
+        swprintf(buf, ARRAYSIZE(buf), L"%s (%02u:%02u)", rel, local.wHour, local.wMinute);
     } else {
         wchar_t day[16] = L"";
         GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &local, L"ddd", day, ARRAYSIZE(day), nullptr);
-        swprintf(buf, ARRAYSIZE(buf), L"%s %02u:%02u", day, local.wHour, local.wMinute);
+        swprintf(buf, ARRAYSIZE(buf), L"%s (%s %02u:%02u)", rel, day, local.wHour, local.wMinute);
     }
     return buf;
 }
