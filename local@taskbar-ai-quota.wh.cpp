@@ -654,17 +654,32 @@ static bool ParseAnthropicUsage(const std::string& body, AccountData* d, std::ws
 static bool ParseOpenAiUsage(const std::string& body, AccountData* d, std::wstring* error) {
     try {
         auto root = JsonObject::Parse(Utf8ToWide(body));
+        auto hasWindows = [](JsonObject const& o) -> bool {
+            return GetObj(o, L"primary_window") || GetObj(o, L"secondary_window") ||
+                   GetObj(o, L"primary") || GetObj(o, L"secondary") ||
+                   GetObj(o, L"five_hour") || GetObj(o, L"weekly") ||
+                   GetObj(o, L"five_hour_limit") || GetObj(o, L"weekly_limit");
+        };
+
         JsonObject usage = root;
-        auto rl = GetObj(usage, L"rate_limit");
-        if (!rl) {
-            if (auto wrapped = GetObj(root, L"usage"); wrapped && GetObj(wrapped, L"rate_limit")) usage = wrapped;
-            else if (auto wrapped = GetObj(root, L"data"); wrapped && GetObj(wrapped, L"rate_limit")) usage = wrapped;
-            rl = GetObj(usage, L"rate_limit");
+        if (!GetObj(root, L"rate_limit") && !hasWindows(root)) {
+            if (auto wrapped = GetObj(root, L"usage");
+                wrapped && (GetObj(wrapped, L"rate_limit") || hasWindows(wrapped))) {
+                usage = wrapped;
+            } else if (auto wrapped = GetObj(root, L"data");
+                       wrapped && (GetObj(wrapped, L"rate_limit") || hasWindows(wrapped))) {
+                usage = wrapped;
+            }
         }
-        if (!rl && (GetObj(usage, L"primary_window") || GetObj(usage, L"secondary_window"))) rl = usage;
+
+        auto rl = GetObj(usage, L"rate_limit");
+        if (!rl && hasWindows(usage)) rl = usage;
 
         auto resetUnixMs = [](JsonObject const& window) -> ULONGLONG {
-            double resetAt = GetNum(window, L"reset_at", 0);
+            double resetAt = GetNum(window, L"reset_time_ms", 0);
+            if (resetAt > 0) return (ULONGLONG)resetAt;
+
+            resetAt = GetNum(window, L"reset_at", 0);
             if (resetAt > 100000000000.0) return (ULONGLONG)resetAt;
             if (resetAt > 0) return (ULONGLONG)(resetAt * 1000);
 
@@ -679,12 +694,28 @@ static bool ParseOpenAiUsage(const std::string& body, AccountData* d, std::wstri
             if (windowSeconds == 5 * 60 * 60) target = &d->win5h;
             else if (windowSeconds == 7 * 24 * 60 * 60) target = &d->winWeek;
 
-            target->pct = GetNum(window, L"used_percent");
+            double pct = GetNum(window, L"used_percent");
+            if (pct < 0) {
+                pct = GetNum(window, L"percent_left");
+                if (pct >= 0) pct = 100 - pct;
+            }
+            if (pct < 0) {
+                pct = GetNum(window, L"remaining_percent");
+                if (pct >= 0) pct = 100 - pct;
+            }
+            if (pct < 0) return;
+            target->pct = pct;
             target->resetUnixMs = resetUnixMs(window);
         };
 
         applyWindow(GetObj(rl, L"primary_window"), &d->win5h);
         applyWindow(GetObj(rl, L"secondary_window"), &d->winWeek);
+        applyWindow(GetObj(rl, L"primary"), &d->win5h);
+        applyWindow(GetObj(rl, L"secondary"), &d->winWeek);
+        applyWindow(GetObj(rl, L"five_hour"), &d->win5h);
+        applyWindow(GetObj(rl, L"weekly"), &d->winWeek);
+        applyWindow(GetObj(rl, L"five_hour_limit"), &d->win5h);
+        applyWindow(GetObj(rl, L"weekly_limit"), &d->winWeek);
 
         d->plan = GetStr(usage, L"plan_type");
         d->codexSparkLines.clear();
