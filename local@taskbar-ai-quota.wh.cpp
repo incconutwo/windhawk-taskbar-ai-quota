@@ -2,7 +2,7 @@
 // @id              taskbar-ai-quota
 // @name            Taskbar AI Quota Bars
 // @description     Shows compact 5-hour and weekly AI agent/LLM subscription quota bars for Anthropic and OpenAI on the Windows 11 taskbar
-// @version         0.6.4
+// @version         0.7.0
 // @author          Cleroth
 // @include         explorer.exe
 // @architecture    x86-64
@@ -19,9 +19,9 @@ Can show on the primary taskbar only, all taskbars, or one specific monitor.
 
 ![Taskbar AI Quota Bars](screenshot.png)
 
-Each account gets one narrow column:
-- top bar: 5-hour usage
-- bottom bar: weekly usage
+Each account gets one compact column:
+- stacked layout: top bar = 5-hour usage, bottom bar = weekly usage
+- horizontal layout: left bar = 5-hour usage, right bar = weekly usage
 
 Hover for exact percentages and reset times. Click a column to refresh that account
 or open the provider dashboard, depending on settings. Right-click for Refresh all
@@ -88,12 +88,18 @@ own auth files if requests start returning `401`.
 - pollIntervalMinutes: 10
   $name: Poll interval (minutes)
   $description: 'Default: 10'
-- barWidth: 100
-  $name: Bar width (px)
+- barLength: 100
+  $name: Bar length (px)
   $description: 'Default: 100. Minimum: 10'
-- barHeight: 8
-  $name: Bar height (px)
+- barThickness: 8
+  $name: Bar thickness (px)
   $description: 'Default: 8'
+- barLayout: stacked
+  $name: Bar layout
+  $description: 'Default: Stacked. Choose vertical stacked bars or side-by-side bars.'
+  $options:
+    - stacked: Stacked (5h above weekly)
+    - horizontal: Horizontal (5h | weekly)
 - showLabels: true
   $name: Show labels
   $description: 'Default: true'
@@ -111,7 +117,7 @@ own auth files if requests start returning `401`.
   $description: 'Default: 3. Gap between label and bars.'
 - barGap: 2
   $name: Bar gap (px)
-  $description: 'Default: 2. Vertical gap between the two quota bars.'
+  $description: 'Default: 2. Gap between the two quota bars.'
 - rightMargin: 4
   $name: Right tray gap (px)
   $description: 'Default: 4. Gap between quota bars and the system tray side.'
@@ -204,14 +210,20 @@ enum class ClickAction {
     OpenDashboard,
 };
 
+enum class BarLayout {
+    Stacked,
+    Horizontal,
+};
+
 struct Settings {
     std::vector<AccountConfig> accounts;
     TaskbarMonitorMode taskbarMonitorMode = TaskbarMonitorMode::Primary;
     ClickAction clickAction = ClickAction::Refresh;
+    BarLayout barLayout = BarLayout::Stacked;
     int taskbarMonitorNumber = 1;
     int pollMinutes = 10;
-    int barWidth = 100;
-    int barHeight = 8;
+    int barLength = 100;
+    int barThickness = 8;
     int labelFontSize = 11;
     int accountMargin = 3;
     int labelGap = 3;
@@ -1582,15 +1594,17 @@ static void ClearQuotaEventState(QuotaUiInstance& state) {
 static Grid BuildQuotaGrid(QuotaUiInstance& state) {
     try {
         std::vector<AccountConfig> accounts;
-        int barWidth, barHeight, labelFontSize, accountMargin, labelGap, barGap, rightMargin;
+        int barLength, barThickness, labelFontSize, accountMargin, labelGap, barGap, rightMargin;
         bool showLabels, labelOnLeft, showPercentText;
+        BarLayout barLayout;
         ClickAction clickAction;
         {
             std::lock_guard<std::mutex> lk(g_settingsMutex);
             accounts = g_settings.accounts;
             clickAction = g_settings.clickAction;
-            barWidth = g_settings.barWidth;
-            barHeight = g_settings.barHeight;
+            barLayout = g_settings.barLayout;
+            barLength = g_settings.barLength;
+            barThickness = g_settings.barThickness;
             labelFontSize = g_settings.labelFontSize;
             accountMargin = g_settings.accountMargin;
             labelGap = g_settings.labelGap;
@@ -1603,6 +1617,7 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
         state.accountRefs.clear();
         if (accounts.empty()) return nullptr;
         state.accountRefs.reserve(accounts.size());
+        bool horizontalBars = barLayout == BarLayout::Horizontal;
 
         Grid root;
         root.Name(kRootName);
@@ -1640,22 +1655,24 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
             }
 
             StackPanel bars;
-            bars.Orientation(Orientation::Vertical);
+            bars.Orientation(horizontalBars ? Orientation::Horizontal : Orientation::Vertical);
             bars.VerticalAlignment(VerticalAlignment::Center);
 
-            double radius = std::max(1.0, barHeight / 2.0);
+            double radius = std::max(1.0, barThickness / 2.0);
             double halfBarGap = barGap / 2.0;
             for (int w = 0; w < 2; w++) {
                 Border track;
-                track.Width(barWidth);
-                track.Height(barHeight);
+                track.Width(barLength);
+                track.Height(barThickness);
                 track.CornerRadius({radius, radius, radius, radius});
-                track.Margin(w == 0 ? Thickness{0, 1, 0, halfBarGap} : Thickness{0, halfBarGap, 0, 1});
+                track.Margin(horizontalBars ?
+                                 (w == 0 ? Thickness{0, 1, halfBarGap, 1} : Thickness{halfBarGap, 1, 0, 1}) :
+                                 (w == 0 ? Thickness{0, 1, 0, halfBarGap} : Thickness{0, halfBarGap, 0, 1}));
                 track.HorizontalAlignment(HorizontalAlignment::Center);
                 track.Background(SolidColorBrush(winrt::Windows::UI::Color{0x46, 0x80, 0x80, 0x80}));
 
                 Border fill;
-                fill.Height(barHeight);
+                fill.Height(barThickness);
                 fill.Width(0);
                 fill.CornerRadius({radius, radius, radius, radius});
                 fill.HorizontalAlignment(HorizontalAlignment::Left);
@@ -1670,7 +1687,7 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
 
             if (showPercentText) {
                 Grid overlay;
-                overlay.Width(barWidth);
+                overlay.Width(horizontalBars ? barLength * 2.0 + barGap : barLength);
                 overlay.VerticalAlignment(VerticalAlignment::Center);
                 overlay.Children().Append(bars);
 
@@ -1749,7 +1766,7 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
     if (!state.quotaGrid) return;
 
     std::vector<AccountConfig> accounts;
-    int intervalMin, barWidth, yellowThreshold, orangeThreshold, redThreshold;
+    int intervalMin, barLength, yellowThreshold, orangeThreshold, redThreshold;
     bool showPercentText, showCodexSparkInTooltip, colorblindMode, showStaleWarning;
     ClickAction clickAction;
     {
@@ -1757,7 +1774,7 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
         accounts = g_settings.accounts;
         intervalMin = g_settings.pollMinutes;
         clickAction = g_settings.clickAction;
-        barWidth = g_settings.barWidth;
+        barLength = g_settings.barLength;
         yellowThreshold = g_settings.yellowThreshold;
         orangeThreshold = g_settings.orangeThreshold;
         redThreshold = g_settings.redThreshold;
@@ -1791,7 +1808,7 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
 
             for (int w = 0; w < 2; w++) {
                 const WindowUsage& wu = w == 0 ? d.win5h : d.winWeek;
-                int px = wu.pct > 0 ? std::clamp((int)std::lround(barWidth * wu.pct / 100.0), 2, barWidth) : 0;
+                int px = wu.pct > 0 ? std::clamp((int)std::lround(barLength * wu.pct / 100.0), 2, barLength) : 0;
                 auto c = UsageColor(wu.pct, stale, yellowThreshold, orangeThreshold, redThreshold,
                                     colorblindMode);
                 uint32_t cv = ((uint32_t)c.A << 24) | ((uint32_t)c.R << 16) |
@@ -2291,8 +2308,8 @@ static void LoadSettings() {
     };
 
     int pollMinutes = getIntSetting(L"pollIntervalMinutes", 10);
-    int barWidth = getIntSetting(L"barWidth", 100);
-    int barHeight = getIntSetting(L"barHeight", 8);
+    int barLength = getIntSetting(L"barLength", 100);
+    int barThickness = getIntSetting(L"barThickness", 8);
     int labelFontSize = getIntSetting(L"labelFontSize", 11);
     int accountMargin = getIntSetting(L"accountMargin", 3);
     int labelGap = getIntSetting(L"labelGap", 3);
@@ -2314,12 +2331,14 @@ static void LoadSettings() {
     }
     std::wstring clickAction = getSettingText(L"clickAction");
     s.clickAction = clickAction == L"open-dashboard" ? ClickAction::OpenDashboard : ClickAction::Refresh;
+    std::wstring barLayout = getSettingText(L"barLayout");
+    s.barLayout = barLayout == L"horizontal" ? BarLayout::Horizontal : BarLayout::Stacked;
     int taskbarMonitorNumber = getIntSetting(L"taskbarMonitorNumber", 1);
 
     s.pollMinutes = std::clamp(pollMinutes > 0 ? pollMinutes : 10, 2, 24 * 60);
     s.taskbarMonitorNumber = std::clamp(taskbarMonitorNumber > 0 ? taskbarMonitorNumber : 1, 1, 64);
-    s.barWidth = std::max(barWidth > 0 ? barWidth : 100, 10);
-    s.barHeight = std::clamp(barHeight > 0 ? barHeight : 8, 2, 20);
+    s.barLength = std::max(barLength > 0 ? barLength : 100, 10);
+    s.barThickness = std::clamp(barThickness > 0 ? barThickness : 8, 2, 20);
     s.labelFontSize = std::clamp(labelFontSize > 0 ? labelFontSize : 11, 6, 24);
     s.accountMargin = std::max(accountMargin, 0);
     s.labelGap = std::max(labelGap, 0);

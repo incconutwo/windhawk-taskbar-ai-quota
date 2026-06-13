@@ -9,8 +9,8 @@ Can show on the primary taskbar only, all taskbars, or one specific monitor.
 
 Each configured account gets one compact taskbar column:
 
-- top bar: 5-hour usage
-- bottom bar: weekly usage
+- stacked layout: top bar = 5-hour usage, bottom bar = weekly usage
+- horizontal layout: left bar = 5-hour usage, right bar = weekly usage
 
 Hover for exact percentages and reset times. Click a column to refresh that account or open the provider dashboard, depending on settings. Right-click a column for Refresh all and Open dashboard.
 
@@ -43,7 +43,7 @@ Useful settings include:
 
 - provider and credential source per account
 - account labels
-- bar width and height
+- bar length, thickness, and layout
 - label position and font size
 - account, label, bar, and tray spacing
 - compact percent text
