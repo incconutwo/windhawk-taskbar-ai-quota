@@ -1519,9 +1519,9 @@ static void LoadSettings() {
     s.barWidth = std::clamp(barWidth > 0 ? barWidth : 100, 10, 100);
     s.barHeight = std::clamp(barHeight > 0 ? barHeight : 8, 2, 20);
     s.labelFontSize = std::clamp(labelFontSize > 0 ? labelFontSize : 11, 6, 24);
-    s.yellowThreshold = std::clamp(yellowThreshold > 0 ? yellowThreshold : 50, 0, 100);
-    s.orangeThreshold = std::clamp(orangeThreshold > 0 ? orangeThreshold : 75, s.yellowThreshold, 100);
-    s.redThreshold = std::clamp(redThreshold > 0 ? redThreshold : 90, s.orangeThreshold, 100);
+    s.yellowThreshold = std::clamp(yellowThreshold, 0, 100);
+    s.orangeThreshold = std::clamp(orangeThreshold, s.yellowThreshold, 100);
+    s.redThreshold = std::clamp(redThreshold, s.orangeThreshold, 100);
     s.showLabels = Wh_GetIntSetting(L"showLabels") != 0;
     s.labelOnLeft = Wh_GetIntSetting(L"labelOnLeft") != 0;
     s.showPercentText = Wh_GetIntSetting(L"showPercentText") != 0;
