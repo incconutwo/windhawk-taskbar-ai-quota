@@ -166,8 +166,6 @@ static HANDLE g_refreshEvent = nullptr;
 static HANDLE g_fetchThread = nullptr;
 static HANDLE g_retryThread = nullptr;
 static HWND g_taskbarWnd = nullptr;
-static std::mutex g_httpHandlesMutex;
-static std::vector<std::atomic<HINTERNET>*> g_httpHandles;
 
 static Grid g_quotaGrid = nullptr;
 static Grid g_injectionParent = nullptr;
@@ -430,120 +428,187 @@ struct HttpResult {
     std::string body;
 };
 
-static void CloseHttpHandle(std::atomic<HINTERNET>& handle) {
-    HINTERNET h = handle.exchange(nullptr);
-    if (h) WinHttpCloseHandle(h);
-}
+struct HttpAsyncState {
+    HANDLE completeEvent = nullptr;
+    HANDLE closeEvent = nullptr;
+    DWORD status = 0;
+    DWORD error = ERROR_SUCCESS;
+    DWORD dataAvailable = 0;
+    DWORD readBytes = 0;
+};
 
-static bool TrackHttpHandle(std::atomic<HINTERNET>* handle) {
-    HINTERNET h = handle->load();
-    if (!h) return false;
+static void CALLBACK HttpStatusCallback(HINTERNET, DWORD_PTR context, DWORD status,
+                                        LPVOID info, DWORD infoLen) {
+    auto* state = reinterpret_cast<HttpAsyncState*>(context);
+    if (!state) return;
 
-    std::lock_guard<std::mutex> lk(g_httpHandlesMutex);
-    if (g_unloading) {
-        h = handle->exchange(nullptr);
-        if (h) WinHttpCloseHandle(h);
-        return false;
-    }
+    state->status = status;
+    state->error = ERROR_SUCCESS;
+    switch (status) {
+        case WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE:
+            state->dataAvailable = infoLen == sizeof(DWORD) ? *static_cast<DWORD*>(info) : 0;
+            SetEvent(state->completeEvent);
+            break;
 
-    g_httpHandles.push_back(handle);
-    return true;
-}
+        case WINHTTP_CALLBACK_STATUS_READ_COMPLETE:
+            state->readBytes = infoLen;
+            SetEvent(state->completeEvent);
+            break;
 
-static void UntrackHttpHandle(std::atomic<HINTERNET>* handle) {
-    std::lock_guard<std::mutex> lk(g_httpHandlesMutex);
-    g_httpHandles.erase(std::remove(g_httpHandles.begin(), g_httpHandles.end(), handle),
-                        g_httpHandles.end());
-}
+        case WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE:
+        case WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE:
+            SetEvent(state->completeEvent);
+            break;
 
-static void CloseActiveHttpHandles() {
-    std::lock_guard<std::mutex> lk(g_httpHandlesMutex);
-    for (auto* handle : g_httpHandles) {
-        HINTERNET h = handle->exchange(nullptr);
-        if (h) WinHttpCloseHandle(h);
+        case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR: {
+            auto* asyncResult = static_cast<WINHTTP_ASYNC_RESULT*>(info);
+            state->error = asyncResult ? asyncResult->dwError : ERROR_WINHTTP_INTERNAL_ERROR;
+            SetEvent(state->completeEvent);
+            break;
+        }
+
+        case WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING:
+            SetEvent(state->closeEvent);
+            break;
     }
 }
 
 static HttpResult HttpGet(PCWSTR host, PCWSTR path, PCWSTR userAgent,
                           const std::wstring& headers) {
     HttpResult res;
-    std::atomic<HINTERNET> ses{WinHttpOpen(userAgent, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                                           WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0)};
-    if (!ses.load()) return res;
-    if (!TrackHttpHandle(&ses)) return res;
-
-    if (HINTERNET hSes = ses.load()) WinHttpSetTimeouts(hSes, 5000, 5000, 5000, 10000);
-
-    std::atomic<HINTERNET> con{nullptr};
-    if (HINTERNET hSes = ses.load()) {
-        con.store(WinHttpConnect(hSes, host, INTERNET_DEFAULT_HTTPS_PORT, 0));
-        if (con.load()) TrackHttpHandle(&con);
+    HttpAsyncState async;
+    async.completeEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    async.closeEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    if (!async.completeEvent || !async.closeEvent) {
+        if (async.completeEvent) CloseHandle(async.completeEvent);
+        if (async.closeEvent) CloseHandle(async.closeEvent);
+        return res;
     }
 
-    std::atomic<HINTERNET> req{nullptr};
-    if (HINTERNET hCon = con.load()) {
-        req.store(WinHttpOpenRequest(hCon, L"GET", path, nullptr,
-                                     WINHTTP_NO_REFERER,
-                                     WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                     WINHTTP_FLAG_SECURE));
-        if (req.load()) TrackHttpHandle(&req);
+    HINTERNET ses = WinHttpOpen(userAgent, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS,
+                                WINHTTP_FLAG_ASYNC);
+    HINTERNET con = nullptr;
+    HINTERNET req = nullptr;
+    bool callbackSet = false;
+
+    auto resetWait = [&]() {
+        ResetEvent(async.completeEvent);
+        async.status = 0;
+        async.error = ERROR_SUCCESS;
+        async.dataAvailable = 0;
+        async.readBytes = 0;
+    };
+    auto waitFor = [&](DWORD expectedStatus) {
+        HANDLE handles[2] = {async.completeEvent, g_stopEvent};
+        DWORD count = g_stopEvent ? 2 : 1;
+        DWORD wait = WaitForMultipleObjects(count, handles, FALSE, INFINITE);
+        return wait == WAIT_OBJECT_0 && async.status == expectedStatus &&
+               async.error == ERROR_SUCCESS;
+    };
+    auto closeRequest = [&]() {
+        if (!req) return;
+        ResetEvent(async.closeEvent);
+        WinHttpCloseHandle(req);
+        if (callbackSet) WaitForSingleObject(async.closeEvent, INFINITE);
+        req = nullptr;
+    };
+
+    if (ses) {
+        WinHttpSetTimeouts(ses, 5000, 5000, 5000, 10000);
+        con = WinHttpConnect(ses, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+        req = con ? WinHttpOpenRequest(con, L"GET", path, nullptr,
+                                       WINHTTP_NO_REFERER,
+                                       WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                       WINHTTP_FLAG_SECURE)
+                  : nullptr;
     }
 
-    HINTERNET hReq = req.load();
-    if (hReq && WinHttpSendRequest(hReq, headers.c_str(), (DWORD)headers.size(),
-                                   WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-        WinHttpReceiveResponse(hReq, nullptr)) {
-        DWORD status = 0, sz = sizeof(status);
-        WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz,
-                            WINHTTP_NO_HEADER_INDEX);
-        res.status = (int)status;
+    DWORD_PTR context = reinterpret_cast<DWORD_PTR>(&async);
+    if (req && WinHttpSetOption(req, WINHTTP_OPTION_CONTEXT_VALUE, &context, sizeof(context)) &&
+        WinHttpSetStatusCallback(req, HttpStatusCallback,
+                                 WINHTTP_CALLBACK_FLAG_SENDREQUEST_COMPLETE |
+                                     WINHTTP_CALLBACK_FLAG_HEADERS_AVAILABLE |
+                                     WINHTTP_CALLBACK_FLAG_DATA_AVAILABLE |
+                                     WINHTTP_CALLBACK_FLAG_READ_COMPLETE |
+                                     WINHTTP_CALLBACK_FLAG_REQUEST_ERROR |
+                                     WINHTTP_CALLBACK_FLAG_HANDLE_CLOSING,
+                                 0) != WINHTTP_INVALID_STATUS_CALLBACK) {
+        callbackSet = true;
+    }
 
-        wchar_t ra[128]{};
-        DWORD raSz = sizeof(ra);
-        if (WinHttpQueryHeaders(hReq, WINHTTP_QUERY_RETRY_AFTER,
-                                WINHTTP_HEADER_NAME_BY_INDEX, ra, &raSz,
-                                WINHTTP_NO_HEADER_INDEX)) {
-            res.retryAfterSec = _wtoi(ra);
-            if (res.retryAfterSec <= 0) {
-                SYSTEMTIME st{};
-                FILETIME ft{};
-                if (WinHttpTimeToSystemTime(ra, &st) && SystemTimeToFileTime(&st, &ft)) {
-                    ULONGLONG t = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
-                    ULONGLONG fileMs = t / 10000;
-                    if (fileMs > 11644473600000ULL) {
-                        ULONGLONG retryUnixMs = fileMs - 11644473600000ULL;
-                        ULONGLONG now = NowUnixMs();
-                        if (retryUnixMs > now) {
-                            ULONGLONG deltaSec = (retryUnixMs - now + 999) / 1000;
-                            res.retryAfterSec = (int)std::min(deltaSec, 24ULL * 60 * 60);
+    if (callbackSet) {
+        resetWait();
+        bool sent = WinHttpSendRequest(req, headers.c_str(), (DWORD)headers.size(),
+                                       WINHTTP_NO_REQUEST_DATA, 0, 0, context) &&
+                    waitFor(WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE);
+
+        resetWait();
+        bool received = sent && WinHttpReceiveResponse(req, nullptr) &&
+                        waitFor(WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE);
+
+        if (received) {
+            DWORD status = 0, sz = sizeof(status);
+            WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz,
+                                WINHTTP_NO_HEADER_INDEX);
+            res.status = (int)status;
+
+            wchar_t ra[128]{};
+            DWORD raSz = sizeof(ra);
+            if (WinHttpQueryHeaders(req, WINHTTP_QUERY_RETRY_AFTER,
+                                    WINHTTP_HEADER_NAME_BY_INDEX, ra, &raSz,
+                                    WINHTTP_NO_HEADER_INDEX)) {
+                res.retryAfterSec = _wtoi(ra);
+                if (res.retryAfterSec <= 0) {
+                    SYSTEMTIME st{};
+                    FILETIME ft{};
+                    if (WinHttpTimeToSystemTime(ra, &st) && SystemTimeToFileTime(&st, &ft)) {
+                        ULONGLONG t = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+                        ULONGLONG fileMs = t / 10000;
+                        if (fileMs > 11644473600000ULL) {
+                            ULONGLONG retryUnixMs = fileMs - 11644473600000ULL;
+                            ULONGLONG now = NowUnixMs();
+                            if (retryUnixMs > now) {
+                                ULONGLONG deltaSec = (retryUnixMs - now + 999) / 1000;
+                                res.retryAfterSec = (int)std::min(deltaSec, 24ULL * 60 * 60);
+                            }
                         }
                     }
                 }
             }
-        }
 
-        for (;;) {
-            DWORD avail = 0;
-            hReq = req.load();
-            if (!hReq || !WinHttpQueryDataAvailable(hReq, &avail) || !avail) break;
-            size_t prev = res.body.size();
-            res.body.resize(prev + avail);
-            DWORD read = 0;
-            hReq = req.load();
-            if (!hReq || !WinHttpReadData(hReq, res.body.data() + prev, avail, &read)) break;
-            res.body.resize(prev + read);
-            if (!read || res.body.size() > 4 * 1024 * 1024) break;
+            bool bodyOk = true;
+            for (;;) {
+                resetWait();
+                if (!WinHttpQueryDataAvailable(req, nullptr) ||
+                    !waitFor(WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE)) {
+                    bodyOk = false;
+                    break;
+                }
+                if (!async.dataAvailable) break;
+
+                size_t prev = res.body.size();
+                res.body.resize(prev + async.dataAvailable);
+                resetWait();
+                if (!WinHttpReadData(req, res.body.data() + prev, async.dataAvailable, nullptr) ||
+                    !waitFor(WINHTTP_CALLBACK_STATUS_READ_COMPLETE)) {
+                    res.body.resize(prev);
+                    bodyOk = false;
+                    break;
+                }
+                res.body.resize(prev + async.readBytes);
+                if (!async.readBytes || res.body.size() > 4 * 1024 * 1024) break;
+            }
+            res.ok = bodyOk;
         }
-        res.ok = true;
     }
 
-    CloseHttpHandle(req);
-    UntrackHttpHandle(&req);
-    CloseHttpHandle(con);
-    UntrackHttpHandle(&con);
-    CloseHttpHandle(ses);
-    UntrackHttpHandle(&ses);
+    closeRequest();
+    if (con) WinHttpCloseHandle(con);
+    if (ses) WinHttpCloseHandle(ses);
+    CloseHandle(async.closeEvent);
+    CloseHandle(async.completeEvent);
     return res;
 }
 
@@ -1385,7 +1450,6 @@ void Wh_ModUninit() {
     Wh_Log(L"Uninit");
     g_unloading = true;
     if (g_stopEvent) SetEvent(g_stopEvent);
-    CloseActiveHttpHandles();
 
     if (g_retryThread) {
         WaitForSingleObject(g_retryThread, INFINITE);
