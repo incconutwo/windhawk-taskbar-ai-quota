@@ -499,12 +499,28 @@ static HttpResult HttpGet(PCWSTR host, PCWSTR path, PCWSTR userAgent,
                             WINHTTP_NO_HEADER_INDEX);
         res.status = (int)status;
 
-        wchar_t ra[32];
+        wchar_t ra[128]{};
         DWORD raSz = sizeof(ra);
         if (WinHttpQueryHeaders(hReq, WINHTTP_QUERY_RETRY_AFTER,
                                 WINHTTP_HEADER_NAME_BY_INDEX, ra, &raSz,
                                 WINHTTP_NO_HEADER_INDEX)) {
             res.retryAfterSec = _wtoi(ra);
+            if (res.retryAfterSec <= 0) {
+                SYSTEMTIME st{};
+                FILETIME ft{};
+                if (WinHttpTimeToSystemTime(ra, &st) && SystemTimeToFileTime(&st, &ft)) {
+                    ULONGLONG t = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+                    ULONGLONG fileMs = t / 10000;
+                    if (fileMs > 11644473600000ULL) {
+                        ULONGLONG retryUnixMs = fileMs - 11644473600000ULL;
+                        ULONGLONG now = NowUnixMs();
+                        if (retryUnixMs > now) {
+                            ULONGLONG deltaSec = (retryUnixMs - now + 999) / 1000;
+                            res.retryAfterSec = (int)std::min(deltaSec, 24ULL * 60 * 60);
+                        }
+                    }
+                }
+            }
         }
 
         for (;;) {
