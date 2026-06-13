@@ -2,7 +2,7 @@
 // @id              taskbar-ai-quota
 // @name            Taskbar AI Quota Bars
 // @description     Shows compact 5-hour and weekly AI agent/LLM subscription quota bars for Anthropic and OpenAI on the Windows 11 taskbar
-// @version         0.8.0
+// @version         0.8.1
 // @author          Cleroth
 // @github          https://github.com/Cleroth
 // @include         explorer.exe
@@ -1281,8 +1281,8 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
                             std::wstring providerName =
                                 accounts[i].provider == L"anthropic" ? L"Anthropic" : L"OpenAI";
                             wchar_t title[96];
-                            swprintf(title, ARRAYSIZE(title), L"%s %s usage at %.0f%%",
-                                     accounts[i].label.c_str(), w == 0 ? L"5h" : L"weekly", wu.pct);
+                            swprintf(title, ARRAYSIZE(title), L"%s usage at %.0f%%",
+                                     w == 0 ? L"5h" : L"weekly", wu.pct);
                             std::wstring body = providerName + L" - resets " + FormatReset(wu.resetUnixMs);
                             FireThresholdNotification(title, body);
                         }
