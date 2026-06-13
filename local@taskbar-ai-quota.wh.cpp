@@ -75,6 +75,9 @@ Default source: `%USERPROFILE%\.local\share\opencode\auth.json`.
 - showPercentText: false
   $name: Show percent text
   $description: 'Default: false. Shows compact 5h/week percentages over the bars.'
+- showCodexSparkInTooltip: false
+  $name: Show Codex Spark in tooltip
+  $description: 'Default: false. Shows OpenAI/Codex Spark plan and rate-limit lines in tooltips.'
 - yellowThreshold: 50
   $name: Yellow threshold (%)
   $description: 'Default: 50. Usage below this stays green.'
@@ -154,6 +157,7 @@ struct Settings {
     bool showLabels = true;
     bool labelOnLeft = true;
     bool showPercentText = false;
+    bool showCodexSparkInTooltip = false;
     bool colorblindMode = false;
     bool showStaleWarning = true;
 };
@@ -167,6 +171,7 @@ struct AccountData {
     WindowUsage win5h;
     WindowUsage winWeek;
     std::wstring plan;
+    std::wstring codexSparkLines;
     std::wstring extraLines;
     std::wstring error;
     ULONGLONG lastSuccessMs = 0;
@@ -649,6 +654,7 @@ static bool ParseOpenAiUsage(const std::string& body, AccountData* d, std::wstri
         }
 
         d->plan = GetStr(usage, L"plan_type");
+        d->codexSparkLines.clear();
         d->extraLines.clear();
         auto addLimitLine = [&](JsonObject const& item) {
             auto itemRl = GetObj(item, L"rate_limit");
@@ -660,8 +666,13 @@ static bool ParseOpenAiUsage(const std::string& body, AccountData* d, std::wstri
             swprintf(line, ARRAYSIZE(line), L"%s: 5h %.0f%% | wk %.0f%%",
                      name.c_str(), GetNum(pw, L"used_percent", 0),
                      GetNum(sw, L"used_percent", 0));
-            if (!d->extraLines.empty()) d->extraLines += L"\n";
-            d->extraLines += line;
+            bool isCodexSpark = name.find(L"Codex-Spark") != std::wstring::npos ||
+                                 name.find(L"Codex Spark") != std::wstring::npos ||
+                                 name.find(L"codex-spark") != std::wstring::npos ||
+                                 name.find(L"codex spark") != std::wstring::npos;
+            std::wstring& target = isCodexSpark ? d->codexSparkLines : d->extraLines;
+            if (!target.empty()) target += L"\n";
+            target += line;
         };
         if (usage.HasKey(L"additional_rate_limits")) {
             auto limits = usage.GetNamedValue(L"additional_rate_limits");
@@ -1119,7 +1130,7 @@ static void UpdateQuotaUi() {
 
     std::vector<AccountConfig> accounts;
     int intervalMin, barWidth, yellowThreshold, orangeThreshold, redThreshold;
-    bool showPercentText, colorblindMode, showStaleWarning;
+    bool showPercentText, showCodexSparkInTooltip, colorblindMode, showStaleWarning;
     {
         std::lock_guard<std::mutex> lk(g_settingsMutex);
         accounts = g_settings.accounts;
@@ -1129,6 +1140,7 @@ static void UpdateQuotaUi() {
         orangeThreshold = g_settings.orangeThreshold;
         redThreshold = g_settings.redThreshold;
         showPercentText = g_settings.showPercentText;
+        showCodexSparkInTooltip = g_settings.showCodexSparkInTooltip;
         colorblindMode = g_settings.colorblindMode;
         showStaleWarning = g_settings.showStaleWarning;
     }
@@ -1174,7 +1186,11 @@ static void UpdateQuotaUi() {
 
             std::wstring tip = (warn ? L"! " : L"") + accounts[i].label + L" - " +
                                (accounts[i].provider == L"anthropic" ? L"Anthropic" : L"OpenAI");
-            if (!d.plan.empty()) tip += L" (" + d.plan + L")";
+            bool planIsSpark = d.plan.find(L"Spark") != std::wstring::npos ||
+                               d.plan.find(L"spark") != std::wstring::npos;
+            if (!d.plan.empty() && (showCodexSparkInTooltip || !planIsSpark)) {
+                tip += L" (" + d.plan + L")";
+            }
             wchar_t line[160];
             if (d.win5h.pct >= 0) {
                 swprintf(line, ARRAYSIZE(line), L"\n5h: %.0f%% | resets %s", d.win5h.pct,
@@ -1189,6 +1205,9 @@ static void UpdateQuotaUi() {
                 tip += line;
             } else {
                 tip += L"\nweek: n/a";
+            }
+            if (showCodexSparkInTooltip && accounts[i].provider == L"openai" && !d.codexSparkLines.empty()) {
+                tip += L"\n" + d.codexSparkLines;
             }
             if (!d.extraLines.empty()) tip += L"\n" + d.extraLines;
             if (!d.error.empty()) tip += L"\nerror: " + d.error;
@@ -1484,8 +1503,13 @@ static void LoadSettings() {
     s.showLabels = Wh_GetIntSetting(L"showLabels") != 0;
     s.labelOnLeft = Wh_GetIntSetting(L"labelOnLeft") != 0;
     s.showPercentText = Wh_GetIntSetting(L"showPercentText") != 0;
+    s.showCodexSparkInTooltip = Wh_GetIntSetting(L"showCodexSparkInTooltip") != 0;
     s.colorblindMode = Wh_GetIntSetting(L"colorblindMode") != 0;
-    s.showStaleWarning = Wh_GetIntSetting(L"showStaleWarning") != 0;
+
+    PCWSTR showStaleWarningText = Wh_GetStringSetting(L"showStaleWarning");
+    bool hasShowStaleWarning = *showStaleWarningText != L'\0';
+    Wh_FreeStringSetting(showStaleWarningText);
+    s.showStaleWarning = !hasShowStaleWarning || Wh_GetIntSetting(L"showStaleWarning") != 0;
 
     {
         std::lock_guard<std::mutex> lk(g_settingsMutex);
