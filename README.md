@@ -12,7 +12,7 @@ Each configured account gets one compact taskbar column:
 - top bar: 5-hour usage
 - bottom bar: weekly usage
 
-Hover for exact percentages and reset times. Click a column to refresh that account.
+Hover for exact percentages and reset times. Click a column to refresh that account or open the provider dashboard, depending on settings. Right-click a column for Refresh all and Open dashboard.
 
 Bars use configurable green/yellow/orange/red thresholds, with an optional colorblind palette. Stale errors can mark labels and tooltips with `!`.
 
@@ -47,6 +47,7 @@ Useful settings include:
 - label position and font size
 - account, label, bar, and tray spacing
 - compact percent text
+- click action: refresh account or open provider dashboard
 - taskbar monitor mode: primary, all, or specific monitor number (`1` = primary, `2+` = secondary taskbars)
 - color thresholds
 - threshold notifications (toast when an account crosses the red threshold)

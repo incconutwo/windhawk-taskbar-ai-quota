@@ -2,7 +2,7 @@
 // @id              taskbar-ai-quota
 // @name            Taskbar AI Quota Bars
 // @description     Shows compact 5-hour and weekly AI agent/LLM subscription quota bars for Anthropic and OpenAI on the Windows 11 taskbar
-// @version         0.5.0
+// @version         0.6.0
 // @author          Cleroth
 // @include         explorer.exe
 // @architecture    x86-64
@@ -21,7 +21,9 @@ Each account gets one narrow column:
 - top bar: 5-hour usage
 - bottom bar: weekly usage
 
-Hover for exact percentages and reset times. Click a column to refresh that account.
+Hover for exact percentages and reset times. Click a column to refresh that account
+or open the provider dashboard, depending on settings. Right-click for Refresh all
+and Open dashboard.
 Bars use configurable green/yellow/orange/red thresholds, with a colorblind palette option.
 Stale errors can mark labels/tooltips with `!`.
 
@@ -75,6 +77,12 @@ own auth files if requests start returning `401`.
 - taskbarMonitorNumber: 1
   $name: Specific monitor number
   $description: 'Default: 1. Used when Taskbar monitors is Specific. 1 is the primary taskbar; 2+ are secondary taskbars in monitor order.'
+- clickAction: refresh
+  $name: Click action
+  $description: 'Default: Refresh account. Choose what left-clicking a quota column does.'
+  $options:
+    - refresh: Refresh account
+    - open-dashboard: Open provider dashboard
 - pollIntervalMinutes: 10
   $name: Poll interval (minutes)
   $description: 'Default: 10'
@@ -189,9 +197,15 @@ enum class TaskbarMonitorMode {
     Specific,
 };
 
+enum class ClickAction {
+    Refresh,
+    OpenDashboard,
+};
+
 struct Settings {
     std::vector<AccountConfig> accounts;
     TaskbarMonitorMode taskbarMonitorMode = TaskbarMonitorMode::Primary;
+    ClickAction clickAction = ClickAction::Refresh;
     int taskbarMonitorNumber = 1;
     int pollMinutes = 10;
     int barWidth = 100;
@@ -244,6 +258,11 @@ struct TapHandler {
     winrt::event_token token{};
 };
 
+struct MenuItemClickHandler {
+    MenuFlyoutItem item{nullptr};
+    winrt::event_token token{};
+};
+
 struct QuotaUiInstance {
     HWND hWnd = nullptr;
     Grid quotaGrid{nullptr};
@@ -251,6 +270,7 @@ struct QuotaUiInstance {
     int quotaColumn = -1;
     bool insertedColumn = false;
     std::vector<TapHandler> tapHandlers;
+    std::vector<MenuItemClickHandler> menuItemClickHandlers;
     std::vector<AppliedState> applied;
 };
 
@@ -467,6 +487,40 @@ static winrt::Windows::UI::Color UsageColor(double pct, bool stale, int yellowTh
     if (pct >= orangeThreshold) return {255, 0xFB, 0x8C, 0x00};
     if (pct >= yellowThreshold) return {255, 0xFD, 0xD8, 0x35};
     return {255, 0x43, 0xA0, 0x47};
+}
+
+static void OpenUrl(PCWSTR url) {
+    if (g_unloading || !url || !*url) return;
+    ShellExecuteW(nullptr, L"open", url, nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+static void RefreshQuota(int accountIndex) {
+    if (g_unloading) return;
+
+    if (!g_fetchThreadStarted.load(std::memory_order_acquire)) {
+        g_refreshing = false;
+        g_refreshAccountIndex = -1;
+        PostUiUpdate();
+        return;
+    }
+
+    g_refreshing = true;
+    g_refreshAccountIndex = accountIndex;
+    g_refreshGeneration++;
+    PostUiUpdate();
+    if (g_refreshEvent) SetEvent(g_refreshEvent);
+}
+
+static void OpenDashboardForAccount(int accountIndex) {
+    std::wstring provider;
+    {
+        std::lock_guard<std::mutex> lk(g_settingsMutex);
+        if (accountIndex < 0 || accountIndex >= (int)g_settings.accounts.size()) return;
+        provider = g_settings.accounts[accountIndex].provider;
+    }
+
+    OpenUrl(provider == L"anthropic" ? L"https://claude.ai/settings/usage"
+                                     : L"https://chatgpt.com/codex/cloud/settings/analytics#usage");
 }
 
 /**********************************************/
@@ -1482,11 +1536,18 @@ static void ClearQuotaEventState(QuotaUiInstance& state) {
         if (!handler.element) continue;
 
         try { handler.element.Tapped(handler.token); } catch (...) {}
+        try { handler.element.ContextFlyout(nullptr); } catch (...) {}
         try {
             ToolTipService::SetToolTip(handler.element, winrt::Windows::Foundation::IInspectable{nullptr});
         } catch (...) {}
     }
     state.tapHandlers.clear();
+
+    for (auto& handler : state.menuItemClickHandlers) {
+        if (!handler.item) continue;
+        try { handler.item.Click(handler.token); } catch (...) {}
+    }
+    state.menuItemClickHandlers.clear();
 }
 
 static Grid BuildQuotaGrid(QuotaUiInstance& state) {
@@ -1494,9 +1555,11 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
         std::vector<AccountConfig> accounts;
         int barWidth, barHeight, labelFontSize, accountMargin, labelGap, barGap, rightMargin;
         bool showLabels, labelOnLeft, showPercentText;
+        ClickAction clickAction;
         {
             std::lock_guard<std::mutex> lk(g_settingsMutex);
             accounts = g_settings.accounts;
+            clickAction = g_settings.clickAction;
             barWidth = g_settings.barWidth;
             barHeight = g_settings.barHeight;
             labelFontSize = g_settings.labelFontSize;
@@ -1599,29 +1662,39 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
             QuotaUiInstance* statePtr = &state;
             int accountIndex = (int)i;
             auto tappedToken = tappedElement.Tapped(
-                [statePtr, accountIndex](winrt::Windows::Foundation::IInspectable const&,
-                                         wuxi::TappedRoutedEventArgs const& e) {
+                [statePtr, accountIndex, clickAction](winrt::Windows::Foundation::IInspectable const&,
+                                                     wuxi::TappedRoutedEventArgs const& e) {
                     if (g_unloading || !statePtr->quotaGrid) {
                         e.Handled(true);
                         return;
                     }
 
-                    if (!g_fetchThreadStarted.load(std::memory_order_acquire)) {
-                        g_refreshing = false;
-                        g_refreshAccountIndex = -1;
-                        PostUiUpdate();
-                        e.Handled(true);
-                        return;
-                    }
-
-                    g_refreshing = true;
-                    g_refreshAccountIndex = accountIndex;
-                    g_refreshGeneration++;
-                    PostUiUpdate();
-                    if (g_refreshEvent) SetEvent(g_refreshEvent);
+                    if (clickAction == ClickAction::OpenDashboard) OpenDashboardForAccount(accountIndex);
+                    else RefreshQuota(accountIndex);
                     e.Handled(true);
                 });
             state.tapHandlers.push_back({tappedElement, tappedToken});
+
+            MenuFlyout menu;
+            MenuFlyoutItem refreshAllItem;
+            refreshAllItem.Text(L"Refresh all");
+            auto refreshAllToken = refreshAllItem.Click(
+                [](winrt::Windows::Foundation::IInspectable const&, RoutedEventArgs const&) {
+                    RefreshQuota(-1);
+                });
+            state.menuItemClickHandlers.push_back({refreshAllItem, refreshAllToken});
+            menu.Items().Append(refreshAllItem);
+
+            MenuFlyoutItem dashboardItem;
+            dashboardItem.Text(L"Open dashboard");
+            auto dashboardToken = dashboardItem.Click(
+                [accountIndex](winrt::Windows::Foundation::IInspectable const&, RoutedEventArgs const&) {
+                    OpenDashboardForAccount(accountIndex);
+                });
+            state.menuItemClickHandlers.push_back({dashboardItem, dashboardToken});
+            menu.Items().Append(dashboardItem);
+
+            tappedElement.ContextFlyout(menu);
 
             panel.Children().Append(col);
         }
@@ -1641,10 +1714,12 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
     std::vector<AccountConfig> accounts;
     int intervalMin, barWidth, yellowThreshold, orangeThreshold, redThreshold;
     bool showPercentText, showCodexSparkInTooltip, colorblindMode, showStaleWarning;
+    ClickAction clickAction;
     {
         std::lock_guard<std::mutex> lk(g_settingsMutex);
         accounts = g_settings.accounts;
         intervalMin = g_settings.pollMinutes;
+        clickAction = g_settings.clickAction;
         barWidth = g_settings.barWidth;
         yellowThreshold = g_settings.yellowThreshold;
         orangeThreshold = g_settings.orangeThreshold;
@@ -1727,7 +1802,9 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
             if (!d.extraLines.empty()) tip += L"\n" + d.extraLines;
             if (!d.error.empty()) tip += L"\nerror: " + d.error;
             tip += L"\n" + FormatUpdated(d.lastSuccessMs, stale);
-            tip += accountRefreshing ? L" - refreshing..." : L" - click to refresh";
+            tip += accountRefreshing ? L" - refreshing..." :
+                   clickAction == ClickAction::OpenDashboard ? L" - click to open dashboard" :
+                   L" - click to refresh";
 
             if (showPercentText) {
                 std::wstring percentText;
@@ -2182,6 +2259,8 @@ static void LoadSettings() {
     } else {
         s.taskbarMonitorMode = TaskbarMonitorMode::Primary;
     }
+    std::wstring clickAction = getSettingText(L"clickAction");
+    s.clickAction = clickAction == L"open-dashboard" ? ClickAction::OpenDashboard : ClickAction::Refresh;
     int taskbarMonitorNumber = getIntSetting(L"taskbarMonitorNumber", 1);
 
     s.pollMinutes = std::clamp(pollMinutes > 0 ? pollMinutes : 10, 2, 24 * 60);
