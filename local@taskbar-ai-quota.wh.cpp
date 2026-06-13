@@ -20,6 +20,7 @@ compact bars on the Windows 11 taskbar, next to the system tray.
 Can show on the primary taskbar only, all taskbars, or one specific monitor.
 
 ![Taskbar AI Quota Bars](https://i.imgur.com/AsaacYF.png)
+![Taskbar AI Quota Bars Detail](https://i.imgur.com/H7agnz2.png)
 
 Each account gets one compact column:
 - stacked layout: stacked horizontal bars, filling left-to-right

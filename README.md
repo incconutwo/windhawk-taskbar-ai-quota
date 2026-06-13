@@ -4,6 +4,7 @@ Shows Anthropic Claude and OpenAI/Codex AI agent and LLM subscription quota usag
 Can show on the primary taskbar only, all taskbars, or one specific monitor.
 
 ![Taskbar AI Quota Bars](https://i.imgur.com/AsaacYF.png)
+![Taskbar AI Quota Bars Detail](https://i.imgur.com/H7agnz2.png)
 
 ## What It Shows
 
