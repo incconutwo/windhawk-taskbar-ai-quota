@@ -209,6 +209,7 @@ static std::vector<AppliedState> g_applied;
 static std::atomic<bool> g_unloading{false};
 static std::atomic<bool> g_refreshing{false};
 static std::atomic<bool> g_uiInjected{false};
+static std::atomic<bool> g_fetchThreadStarted{false};
 static HANDLE g_stopEvent = nullptr;
 static HANDLE g_refreshEvent = nullptr;
 static HANDLE g_fetchThread = nullptr;
@@ -1221,6 +1222,13 @@ static Grid BuildQuotaGrid() {
                         return;
                     }
 
+                    if (!g_fetchThreadStarted.load(std::memory_order_acquire)) {
+                        g_refreshing = false;
+                        UpdateQuotaUi();
+                        e.Handled(true);
+                        return;
+                    }
+
                     g_refreshing = true;
                     UpdateQuotaUi();
                     if (g_refreshEvent) SetEvent(g_refreshEvent);
@@ -1521,6 +1529,18 @@ static void StartRetryInject() {
     }
 
     g_retryThread = CreateThread(nullptr, 0, RetryInjectThreadProc, nullptr, 0, nullptr);
+    if (g_retryThread) return;
+
+    DWORD err = GetLastError();
+    Wh_Log(L"CreateThread RetryInjectThreadProc failed: %lu", err);
+
+    HWND hWnd = GetCachedTaskbarWnd();
+    bool injected = false;
+    if (!hWnd || !RunFromWindowThread(hWnd, [](void* param) {
+            *static_cast<bool*>(param) = !g_unloading && InjectQuotaGrid();
+        }, &injected) || !injected) {
+        Wh_Log(L"InjectQuotaGrid fallback failed");
+    }
 }
 
 /**********************************************/
@@ -1681,6 +1701,7 @@ BOOL Wh_ModInit() {
     g_unloading = false;
     g_refreshing = false;
     g_uiInjected.store(false, std::memory_order_release);
+    g_fetchThreadStarted.store(false, std::memory_order_release);
     LoadSettings();
 
     if (!HookTaskbarDllSymbols()) {
@@ -1696,8 +1717,26 @@ BOOL Wh_ModInit() {
 void Wh_ModAfterInit() {
     HWND hWnd = FindCurrentProcessTaskbarWnd();
     g_taskbarWnd.store(hWnd, std::memory_order_release);
-    if (hWnd) StartRetryInject();
+
     g_fetchThread = CreateThread(nullptr, 0, FetchThreadProc, nullptr, 0, nullptr);
+    if (g_fetchThread) {
+        g_fetchThreadStarted.store(true, std::memory_order_release);
+    } else {
+        DWORD err = GetLastError();
+        Wh_Log(L"CreateThread FetchThreadProc failed: %lu", err);
+        g_refreshing = false;
+        g_fetchThreadStarted.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(g_dataMutex);
+            for (auto& data : g_data) {
+                data.stale = true;
+                data.error = L"fetch thread failed";
+            }
+        }
+    }
+
+    if (hWnd) StartRetryInject();
+    if (!g_fetchThread) PostUiUpdate();
 }
 
 void Wh_ModUninit() {
@@ -1717,6 +1756,7 @@ void Wh_ModUninit() {
         CloseHandle(g_fetchThread);
         g_fetchThread = nullptr;
     }
+    g_fetchThreadStarted.store(false, std::memory_order_release);
 
     HWND hWnd = GetCachedTaskbarWnd();
     if (hWnd && !RunFromWindowThread(hWnd, [](void*) { RemoveQuotaGrid(); }, nullptr)) {
