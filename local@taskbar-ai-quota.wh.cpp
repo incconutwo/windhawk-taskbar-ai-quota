@@ -201,6 +201,7 @@ struct TapHandler {
 
 static Settings g_settings;
 static std::mutex g_settingsMutex;
+static ULONGLONG g_settingsGeneration = 0;
 static std::vector<AccountData> g_data;
 static std::mutex g_dataMutex;
 static std::vector<AppliedState> g_applied;
@@ -852,15 +853,22 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
     try { winrt::init_apartment(winrt::apartment_type::multi_threaded); } catch (...) {}
 
     std::vector<std::wstring> lastLoggedErrorStates;
+    ULONGLONG lastLoggedSettingsGeneration = 0;
     while (!g_unloading) {
         std::vector<AccountConfig> accounts;
         int intervalMin;
+        ULONGLONG settingsGeneration;
         {
             std::lock_guard<std::mutex> lk(g_settingsMutex);
             accounts = g_settings.accounts;
             intervalMin = g_settings.pollMinutes;
+            settingsGeneration = g_settingsGeneration;
         }
-        if (lastLoggedErrorStates.size() != accounts.size()) lastLoggedErrorStates.assign(accounts.size(), {});
+        if (lastLoggedSettingsGeneration != settingsGeneration ||
+            lastLoggedErrorStates.size() != accounts.size()) {
+            lastLoggedErrorStates.assign(accounts.size(), {});
+            lastLoggedSettingsGeneration = settingsGeneration;
+        }
 
         std::vector<AccountData> results(accounts.size());
         {
@@ -891,12 +899,19 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
             }
         }
 
+        bool published = false;
         {
-            std::lock_guard<std::mutex> lk(g_dataMutex);
-            if (g_data.size() == results.size()) g_data = std::move(results);
+            std::lock_guard<std::mutex> lk(g_settingsMutex);
+            if (settingsGeneration == g_settingsGeneration) {
+                std::lock_guard<std::mutex> lk2(g_dataMutex);
+                if (g_data.size() == results.size()) {
+                    g_data = std::move(results);
+                    published = true;
+                }
+            }
         }
         g_refreshing = false;
-        PostUiUpdate();
+        if (published) PostUiUpdate();
 
         DWORD waitMs = (DWORD)intervalMin * 60000;
         if (minRetryAfter > 0) waitMs = std::clamp((DWORD)minRetryAfter * 1000, (DWORD)30000, waitMs);
@@ -1618,11 +1633,9 @@ static void LoadSettings() {
 
     {
         std::lock_guard<std::mutex> lk(g_settingsMutex);
-        g_settings = std::move(s);
-    }
-    {
-        std::lock_guard<std::mutex> lk(g_settingsMutex);
         std::lock_guard<std::mutex> lk2(g_dataMutex);
+        g_settings = std::move(s);
+        g_settingsGeneration++;
         g_data.assign(g_settings.accounts.size(), {});
     }
 }
