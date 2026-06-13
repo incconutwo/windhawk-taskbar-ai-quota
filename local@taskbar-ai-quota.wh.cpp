@@ -22,6 +22,7 @@ Each account gets one narrow column:
 
 Bars use green/yellow/orange/red threshold colors, and gray when stale.
 Enable colorblind mode to switch to a blue/orange palette.
+Stale errors can mark labels/tooltips with `!`.
 Hover for exact percentages/reset times. Click a column to refresh.
 
 Credentials are read-only. The mod never refreshes or rewrites tokens.
@@ -86,6 +87,9 @@ Default source: `%USERPROFILE%\.local\share\opencode\auth.json`.
 - colorblindMode: false
   $name: Colorblind mode
   $description: 'Default: false. Uses a blue-to-orange palette instead of green/red.'
+- showStaleWarning: true
+  $name: Show stale warning
+  $description: 'Default: true. Marks stale error states with ! in labels and tooltips.'
 */
 // ==/WindhawkModSettings==
 
@@ -151,6 +155,7 @@ struct Settings {
     bool labelOnLeft = true;
     bool showPercentText = false;
     bool colorblindMode = false;
+    bool showStaleWarning = true;
 };
 
 struct WindowUsage {
@@ -173,6 +178,7 @@ struct AppliedState {
     uint32_t fillColor[2] = {0, 0};
     std::wstring tip;
     std::wstring percentText;
+    std::wstring labelText;
     double labelOpacity = -1;
 };
 
@@ -1152,7 +1158,7 @@ static void UpdateQuotaUi() {
 
     std::vector<AccountConfig> accounts;
     int intervalMin, barWidth, yellowThreshold, orangeThreshold, redThreshold;
-    bool showPercentText, colorblindMode;
+    bool showPercentText, colorblindMode, showStaleWarning;
     {
         std::lock_guard<std::mutex> lk(g_settingsMutex);
         accounts = g_settings.accounts;
@@ -1163,6 +1169,7 @@ static void UpdateQuotaUi() {
         redThreshold = g_settings.redThreshold;
         showPercentText = g_settings.showPercentText;
         colorblindMode = g_settings.colorblindMode;
+        showStaleWarning = g_settings.showStaleWarning;
     }
 
     std::vector<AccountData> data;
@@ -1181,6 +1188,7 @@ static void UpdateQuotaUi() {
             AppliedState& ap = g_applied[i];
             bool stale = d.stale || d.lastSuccessMs == 0 ||
                          now - d.lastSuccessMs > (ULONGLONG)intervalMin * 2 * 60000;
+            bool warn = showStaleWarning && stale && !d.error.empty();
 
             for (int w = 0; w < 2; w++) {
                 const WindowUsage& wu = w == 0 ? d.win5h : d.winWeek;
@@ -1202,7 +1210,7 @@ static void UpdateQuotaUi() {
                 }
             }
 
-            std::wstring tip = accounts[i].label + L" - " +
+            std::wstring tip = (warn ? L"! " : L"") + accounts[i].label + L" - " +
                                (accounts[i].provider == L"anthropic" ? L"Anthropic" : L"OpenAI");
             if (!d.plan.empty()) tip += L" (" + d.plan + L")";
             wchar_t line[160];
@@ -1254,10 +1262,15 @@ static void UpdateQuotaUi() {
             }
 
             double labelOpacity = stale ? 0.45 : 0.8;
-            if (labelOpacity != ap.labelOpacity) {
+            std::wstring labelText = warn ? accounts[i].label + L"!" : accounts[i].label;
+            if (labelOpacity != ap.labelOpacity || labelText != ap.labelText) {
                 swprintf(name, ARRAYSIZE(name), L"AiQuota_Label_%d", (int)i);
-                if (auto fe = FindChildByName(g_quotaGrid, name)) fe.Opacity(labelOpacity);
+                if (auto fe = FindChildByName(g_quotaGrid, name)) {
+                    fe.Opacity(labelOpacity);
+                    if (auto tb = fe.try_as<TextBlock>()) tb.Text(labelText);
+                }
                 ap.labelOpacity = labelOpacity;
+                ap.labelText = std::move(labelText);
             }
         }
     } catch (...) {
@@ -1500,6 +1513,7 @@ static void LoadSettings() {
     s.labelOnLeft = Wh_GetIntSetting(L"labelOnLeft") != 0;
     s.showPercentText = Wh_GetIntSetting(L"showPercentText") != 0;
     s.colorblindMode = Wh_GetIntSetting(L"colorblindMode") != 0;
+    s.showStaleWarning = Wh_GetIntSetting(L"showStaleWarning") != 0;
 
     {
         std::lock_guard<std::mutex> lk(g_settingsMutex);
