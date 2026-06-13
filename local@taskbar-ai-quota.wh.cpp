@@ -853,6 +853,7 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
     try { winrt::init_apartment(winrt::apartment_type::multi_threaded); } catch (...) {}
 
     std::vector<std::wstring> lastLoggedErrorStates;
+    std::vector<ULONGLONG> retryDeadlineMs;
     ULONGLONG lastLoggedSettingsGeneration = 0;
     while (!g_unloading) {
         std::vector<AccountConfig> accounts;
@@ -867,6 +868,7 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
         if (lastLoggedSettingsGeneration != settingsGeneration ||
             lastLoggedErrorStates.size() != accounts.size()) {
             lastLoggedErrorStates.assign(accounts.size(), {});
+            retryDeadlineMs.assign(accounts.size(), 0);
             lastLoggedSettingsGeneration = settingsGeneration;
         }
 
@@ -876,13 +878,30 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
             if (g_data.size() == results.size()) results = g_data;
         }
 
-        int minRetryAfter = 0;
+        ULONGLONG nextRetryMs = 0;
         bool anyError = false;
         for (size_t i = 0; i < accounts.size() && !g_unloading; i++) {
+            ULONGLONG nowMs = NowUnixMs();
+            if (retryDeadlineMs[i] > nowMs) {
+                if (nextRetryMs == 0 || retryDeadlineMs[i] < nextRetryMs) {
+                    nextRetryMs = retryDeadlineMs[i];
+                }
+                continue;
+            }
+
             int retryAfter = 0;
             FetchAccount(accounts[i], &results[i], &retryAfter);
+            if (retryAfter > 0) {
+                retryDeadlineMs[i] = NowUnixMs() + (ULONGLONG)retryAfter * 1000;
+                if (nextRetryMs == 0 || retryDeadlineMs[i] < nextRetryMs) {
+                    nextRetryMs = retryDeadlineMs[i];
+                }
+            } else {
+                retryDeadlineMs[i] = 0;
+            }
+
             if (!results[i].error.empty()) {
-                anyError = true;
+                if (retryAfter <= 0) anyError = true;
                 std::wstring errorState = accounts[i].provider + L"\n" + accounts[i].authSource + L"\n" +
                                           accounts[i].authFile + L"\n" + accounts[i].authKey + L"\n" +
                                           results[i].error;
@@ -893,9 +912,6 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
                 }
             } else {
                 lastLoggedErrorStates[i].clear();
-            }
-            if (retryAfter > 0 && (minRetryAfter == 0 || retryAfter < minRetryAfter)) {
-                minRetryAfter = retryAfter;
             }
         }
 
@@ -914,8 +930,11 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
         if (published) PostUiUpdate();
 
         DWORD waitMs = (DWORD)intervalMin * 60000;
-        if (minRetryAfter > 0) waitMs = std::clamp((DWORD)minRetryAfter * 1000, (DWORD)30000, waitMs);
-        else if (anyError) waitMs = std::min(waitMs, (DWORD)120000);
+        if (anyError) waitMs = std::min(waitMs, (DWORD)120000);
+        ULONGLONG nowMs = NowUnixMs();
+        if (nextRetryMs > nowMs) {
+            waitMs = (DWORD)std::min<ULONGLONG>(waitMs, nextRetryMs - nowMs);
+        }
 
         HANDLE handles[2] = {g_stopEvent, g_refreshEvent};
         if (WaitForMultipleObjects(2, handles, FALSE, waitMs) == WAIT_OBJECT_0) break;
