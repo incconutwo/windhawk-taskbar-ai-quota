@@ -99,10 +99,6 @@ Default source: `%USERPROFILE%\.local\share\opencode\auth.json`.
 #include <winhttp.h>
 #include <unknwn.h>
 
-#ifndef WINHTTP_CALLBACK_FLAG_HANDLES
-#define WINHTTP_CALLBACK_FLAG_HANDLES WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING
-#endif
-
 #ifdef GetCurrentTime
 #undef GetCurrentTime
 #endif
@@ -379,12 +375,6 @@ static JsonObject GetObj(JsonObject const& o, PCWSTR name) {
     return v.ValueType() == JsonValueType::Object ? v.GetObject() : nullptr;
 }
 
-static JsonArray GetArr(JsonObject const& o, PCWSTR name) {
-    if (!o || !o.HasKey(name)) return nullptr;
-    auto v = o.GetNamedValue(name);
-    return v.ValueType() == JsonValueType::Array ? v.GetArray() : nullptr;
-}
-
 static double GetNum(JsonObject const& o, PCWSTR name, double def = -1) {
     if (!o || !o.HasKey(name)) return def;
     auto v = o.GetNamedValue(name);
@@ -403,6 +393,29 @@ static bool GetBool(JsonObject const& o, PCWSTR name) {
     if (!o || !o.HasKey(name)) return false;
     auto v = o.GetNamedValue(name);
     return v.ValueType() == JsonValueType::Boolean && v.GetBoolean();
+}
+
+static std::wstring DescribeJsonBody(const std::string& body) {
+    if (body.empty()) return L"empty body";
+
+    try {
+        auto root = JsonObject::Parse(Utf8ToWide(body));
+        std::wstring keys;
+        int count = 0;
+        for (auto const& kv : root) {
+            if (count == 8) {
+                keys += L", ...";
+                break;
+            }
+            if (!keys.empty()) keys += L", ";
+            auto key = kv.Key();
+            keys += std::wstring(key.c_str(), key.size());
+            count++;
+        }
+        return keys.empty() ? L"JSON object with no keys" : L"keys: " + keys;
+    } catch (...) {
+        return L"non-object or invalid JSON body";
+    }
 }
 
 /**********************************************/
@@ -474,91 +487,14 @@ struct HttpResult {
     std::string body;
 };
 
-struct HttpAsyncState {
-    HANDLE completeEvent = nullptr;
-    HANDLE closeEvent = nullptr;
-    DWORD status = 0;
-    DWORD error = ERROR_SUCCESS;
-    DWORD dataAvailable = 0;
-    DWORD readBytes = 0;
-};
-
-static void CALLBACK HttpStatusCallback(HINTERNET, DWORD_PTR context, DWORD status,
-                                        LPVOID info, DWORD infoLen) {
-    auto* state = reinterpret_cast<HttpAsyncState*>(context);
-    if (!state) return;
-
-    state->status = status;
-    state->error = ERROR_SUCCESS;
-    switch (status) {
-        case WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE:
-            state->dataAvailable = infoLen == sizeof(DWORD) ? *static_cast<DWORD*>(info) : 0;
-            SetEvent(state->completeEvent);
-            break;
-
-        case WINHTTP_CALLBACK_STATUS_READ_COMPLETE:
-            state->readBytes = infoLen;
-            SetEvent(state->completeEvent);
-            break;
-
-        case WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE:
-        case WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE:
-            SetEvent(state->completeEvent);
-            break;
-
-        case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR: {
-            auto* asyncResult = static_cast<WINHTTP_ASYNC_RESULT*>(info);
-            state->error = asyncResult ? asyncResult->dwError : ERROR_WINHTTP_INTERNAL_ERROR;
-            SetEvent(state->completeEvent);
-            break;
-        }
-
-        case WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING:
-            SetEvent(state->closeEvent);
-            break;
-    }
-}
-
 static HttpResult HttpGet(PCWSTR host, PCWSTR path, PCWSTR userAgent,
                           const std::wstring& headers) {
     HttpResult res;
-    HttpAsyncState async;
-    async.completeEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-    async.closeEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-    if (!async.completeEvent || !async.closeEvent) {
-        if (async.completeEvent) CloseHandle(async.completeEvent);
-        if (async.closeEvent) CloseHandle(async.closeEvent);
-        return res;
-    }
-
     HINTERNET ses = WinHttpOpen(userAgent, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS,
-                                WINHTTP_FLAG_ASYNC);
+                                0);
     HINTERNET con = nullptr;
     HINTERNET req = nullptr;
-    bool callbackSet = false;
-
-    auto resetWait = [&]() {
-        ResetEvent(async.completeEvent);
-        async.status = 0;
-        async.error = ERROR_SUCCESS;
-        async.dataAvailable = 0;
-        async.readBytes = 0;
-    };
-    auto waitFor = [&](DWORD expectedStatus) {
-        HANDLE handles[2] = {async.completeEvent, g_stopEvent};
-        DWORD count = g_stopEvent ? 2 : 1;
-        DWORD wait = WaitForMultipleObjects(count, handles, FALSE, INFINITE);
-        return wait == WAIT_OBJECT_0 && async.status == expectedStatus &&
-               async.error == ERROR_SUCCESS;
-    };
-    auto closeRequest = [&]() {
-        if (!req) return;
-        ResetEvent(async.closeEvent);
-        WinHttpCloseHandle(req);
-        if (callbackSet) WaitForSingleObject(async.closeEvent, INFINITE);
-        req = nullptr;
-    };
 
     if (ses) {
         WinHttpSetTimeouts(ses, 5000, 5000, 5000, 10000);
@@ -570,91 +506,65 @@ static HttpResult HttpGet(PCWSTR host, PCWSTR path, PCWSTR userAgent,
                   : nullptr;
     }
 
-    DWORD_PTR context = reinterpret_cast<DWORD_PTR>(&async);
-    if (req && WinHttpSetOption(req, WINHTTP_OPTION_CONTEXT_VALUE, &context, sizeof(context)) &&
-        WinHttpSetStatusCallback(req, HttpStatusCallback,
-                                 WINHTTP_CALLBACK_FLAG_SENDREQUEST_COMPLETE |
-                                     WINHTTP_CALLBACK_FLAG_HEADERS_AVAILABLE |
-                                     WINHTTP_CALLBACK_FLAG_DATA_AVAILABLE |
-                                     WINHTTP_CALLBACK_FLAG_READ_COMPLETE |
-                                     WINHTTP_CALLBACK_FLAG_REQUEST_ERROR |
-                                     WINHTTP_CALLBACK_FLAG_HANDLES,
-                                 0) != WINHTTP_INVALID_STATUS_CALLBACK) {
-        callbackSet = true;
-    }
+    if (req && WinHttpSendRequest(req, headers.c_str(), (DWORD)headers.size(),
+                                  WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(req, nullptr)) {
+        DWORD status = 0, sz = sizeof(status);
+        WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz,
+                            WINHTTP_NO_HEADER_INDEX);
+        res.status = (int)status;
 
-    if (callbackSet) {
-        resetWait();
-        bool sent = WinHttpSendRequest(req, headers.c_str(), (DWORD)headers.size(),
-                                       WINHTTP_NO_REQUEST_DATA, 0, 0, context) &&
-                    waitFor(WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE);
-
-        resetWait();
-        bool received = sent && WinHttpReceiveResponse(req, nullptr) &&
-                        waitFor(WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE);
-
-        if (received) {
-            DWORD status = 0, sz = sizeof(status);
-            WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                                WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz,
-                                WINHTTP_NO_HEADER_INDEX);
-            res.status = (int)status;
-
-            wchar_t ra[128]{};
-            DWORD raSz = sizeof(ra);
-            if (WinHttpQueryHeaders(req, WINHTTP_QUERY_RETRY_AFTER,
-                                    WINHTTP_HEADER_NAME_BY_INDEX, ra, &raSz,
-                                    WINHTTP_NO_HEADER_INDEX)) {
-                res.retryAfterSec = _wtoi(ra);
-                if (res.retryAfterSec <= 0) {
-                    SYSTEMTIME st{};
-                    FILETIME ft{};
-                    if (WinHttpTimeToSystemTime(ra, &st) && SystemTimeToFileTime(&st, &ft)) {
-                        ULONGLONG t = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
-                        ULONGLONG fileMs = t / 10000;
-                        if (fileMs > 11644473600000ULL) {
-                            ULONGLONG retryUnixMs = fileMs - 11644473600000ULL;
-                            ULONGLONG now = NowUnixMs();
-                            if (retryUnixMs > now) {
-                                ULONGLONG deltaSec = (retryUnixMs - now + 999) / 1000;
-                                res.retryAfterSec = (int)std::min(deltaSec, 24ULL * 60 * 60);
-                            }
+        wchar_t ra[128]{};
+        DWORD raSz = sizeof(ra);
+        if (WinHttpQueryHeaders(req, WINHTTP_QUERY_RETRY_AFTER,
+                                WINHTTP_HEADER_NAME_BY_INDEX, ra, &raSz,
+                                WINHTTP_NO_HEADER_INDEX)) {
+            res.retryAfterSec = _wtoi(ra);
+            if (res.retryAfterSec <= 0) {
+                SYSTEMTIME st{};
+                FILETIME ft{};
+                if (WinHttpTimeToSystemTime(ra, &st) && SystemTimeToFileTime(&st, &ft)) {
+                    ULONGLONG t = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+                    ULONGLONG fileMs = t / 10000;
+                    if (fileMs > 11644473600000ULL) {
+                        ULONGLONG retryUnixMs = fileMs - 11644473600000ULL;
+                        ULONGLONG now = NowUnixMs();
+                        if (retryUnixMs > now) {
+                            ULONGLONG deltaSec = (retryUnixMs - now + 999) / 1000;
+                            res.retryAfterSec = (int)std::min(deltaSec, 24ULL * 60 * 60);
                         }
                     }
                 }
             }
-
-            bool bodyOk = true;
-            for (;;) {
-                resetWait();
-                if (!WinHttpQueryDataAvailable(req, nullptr) ||
-                    !waitFor(WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE)) {
-                    bodyOk = false;
-                    break;
-                }
-                if (!async.dataAvailable) break;
-
-                size_t prev = res.body.size();
-                res.body.resize(prev + async.dataAvailable);
-                resetWait();
-                if (!WinHttpReadData(req, res.body.data() + prev, async.dataAvailable, nullptr) ||
-                    !waitFor(WINHTTP_CALLBACK_STATUS_READ_COMPLETE)) {
-                    res.body.resize(prev);
-                    bodyOk = false;
-                    break;
-                }
-                res.body.resize(prev + async.readBytes);
-                if (!async.readBytes || res.body.size() > 4 * 1024 * 1024) break;
-            }
-            res.ok = bodyOk;
         }
+
+        bool bodyOk = true;
+        for (;;) {
+            DWORD available = 0;
+            if (!WinHttpQueryDataAvailable(req, &available)) {
+                bodyOk = false;
+                break;
+            }
+            if (!available) break;
+
+            size_t prev = res.body.size();
+            res.body.resize(prev + available);
+            DWORD read = 0;
+            if (!WinHttpReadData(req, res.body.data() + prev, available, &read)) {
+                res.body.resize(prev);
+                bodyOk = false;
+                break;
+            }
+            res.body.resize(prev + read);
+            if (!read || res.body.size() > 4 * 1024 * 1024) break;
+        }
+        res.ok = bodyOk;
     }
 
-    closeRequest();
+    if (req) WinHttpCloseHandle(req);
     if (con) WinHttpCloseHandle(con);
     if (ses) WinHttpCloseHandle(ses);
-    CloseHandle(async.closeEvent);
-    CloseHandle(async.completeEvent);
     return res;
 }
 
@@ -662,74 +572,105 @@ static HttpResult HttpGet(PCWSTR host, PCWSTR path, PCWSTR userAgent,
 //  Usage Parsers
 /**********************************************/
 
-static bool ParseAnthropicUsage(const std::string& body, AccountData* d) {
+static bool ParseAnthropicUsage(const std::string& body, AccountData* d, std::wstring* error) {
     try {
         auto root = JsonObject::Parse(Utf8ToWide(body));
-        if (auto fh = GetObj(root, L"five_hour")) {
+        JsonObject usage = root;
+        if (!GetObj(usage, L"five_hour") && !GetObj(usage, L"seven_day")) {
+            if (auto wrapped = GetObj(root, L"usage")) usage = wrapped;
+            else if (auto wrapped = GetObj(root, L"data")) usage = wrapped;
+        }
+
+        if (auto fh = GetObj(usage, L"five_hour")) {
             d->win5h.pct = GetNum(fh, L"utilization");
             d->win5h.resetUnixMs = ParseIso8601Ms(GetStr(fh, L"resets_at"));
         }
-        if (auto sd = GetObj(root, L"seven_day")) {
+        if (auto sd = GetObj(usage, L"seven_day")) {
             d->winWeek.pct = GetNum(sd, L"utilization");
             d->winWeek.resetUnixMs = ParseIso8601Ms(GetStr(sd, L"resets_at"));
         }
 
         d->plan.clear();
         d->extraLines.clear();
-        if (auto op = GetObj(root, L"seven_day_opus"); op && GetNum(op, L"utilization") >= 0) {
+        if (auto op = GetObj(usage, L"seven_day_opus"); op && GetNum(op, L"utilization") >= 0) {
             wchar_t line[64];
             swprintf(line, ARRAYSIZE(line), L"opus week: %.0f%%", GetNum(op, L"utilization"));
             d->extraLines += line;
         }
-        if (auto eu = GetObj(root, L"extra_usage"); eu && GetBool(eu, L"is_enabled")) {
+        if (auto eu = GetObj(usage, L"extra_usage"); eu && GetBool(eu, L"is_enabled")) {
             wchar_t line[96];
             swprintf(line, ARRAYSIZE(line), L"extra usage: %.1f%% monthly",
                      GetNum(eu, L"utilization", 0));
             if (!d->extraLines.empty()) d->extraLines += L"\n";
             d->extraLines += line;
         }
-        return d->win5h.pct >= 0 || d->winWeek.pct >= 0;
+        bool parsed = d->win5h.pct >= 0 || d->winWeek.pct >= 0;
+        if (!parsed && error) *error = L"unexpected response format (" + DescribeJsonBody(body) + L")";
+        return parsed;
     } catch (...) {
+        if (error) *error = L"unexpected response format (" + DescribeJsonBody(body) + L")";
         return false;
     }
 }
 
-static bool ParseOpenAiUsage(const std::string& body, AccountData* d) {
+static bool ParseOpenAiUsage(const std::string& body, AccountData* d, std::wstring* error) {
     try {
         auto root = JsonObject::Parse(Utf8ToWide(body));
-        auto rl = GetObj(root, L"rate_limit");
+        JsonObject usage = root;
+        auto rl = GetObj(usage, L"rate_limit");
+        if (!rl) {
+            if (auto wrapped = GetObj(root, L"usage"); wrapped && GetObj(wrapped, L"rate_limit")) usage = wrapped;
+            else if (auto wrapped = GetObj(root, L"data"); wrapped && GetObj(wrapped, L"rate_limit")) usage = wrapped;
+            rl = GetObj(usage, L"rate_limit");
+        }
+        if (!rl && (GetObj(usage, L"primary_window") || GetObj(usage, L"secondary_window"))) rl = usage;
+
+        auto resetUnixMs = [](JsonObject const& window) -> ULONGLONG {
+            double resetAt = GetNum(window, L"reset_at", 0);
+            if (resetAt > 100000000000.0) return (ULONGLONG)resetAt;
+            if (resetAt > 0) return (ULONGLONG)(resetAt * 1000);
+
+            double resetAfter = GetNum(window, L"reset_after_seconds", 0);
+            return resetAfter > 0 ? NowUnixMs() + (ULONGLONG)(resetAfter * 1000) : 0ULL;
+        };
+
         if (auto pw = GetObj(rl, L"primary_window")) {
             d->win5h.pct = GetNum(pw, L"used_percent");
-            double resetAt = GetNum(pw, L"reset_at", 0);
-            d->win5h.resetUnixMs = resetAt > 0 ? (ULONGLONG)(resetAt * 1000) : 0;
+            d->win5h.resetUnixMs = resetUnixMs(pw);
         }
         if (auto sw = GetObj(rl, L"secondary_window")) {
             d->winWeek.pct = GetNum(sw, L"used_percent");
-            double resetAt = GetNum(sw, L"reset_at", 0);
-            d->winWeek.resetUnixMs = resetAt > 0 ? (ULONGLONG)(resetAt * 1000) : 0;
+            d->winWeek.resetUnixMs = resetUnixMs(sw);
         }
 
-        d->plan = GetStr(root, L"plan_type");
+        d->plan = GetStr(usage, L"plan_type");
         d->extraLines.clear();
-        if (auto arr = GetArr(root, L"additional_rate_limits")) {
-            for (uint32_t i = 0; i < arr.Size() && i < 3; i++) {
-                if (arr.GetAt(i).ValueType() != JsonValueType::Object) continue;
-                auto item = arr.GetAt(i).GetObject();
-                auto itemRl = GetObj(item, L"rate_limit");
-                auto pw = GetObj(itemRl, L"primary_window");
-                auto sw = GetObj(itemRl, L"secondary_window");
-                std::wstring name = GetStr(item, L"limit_name");
-                if (name.empty() || (!pw && !sw)) continue;
-                wchar_t line[128];
-                swprintf(line, ARRAYSIZE(line), L"%s: 5h %.0f%% | wk %.0f%%",
-                         name.c_str(), GetNum(pw, L"used_percent", 0),
-                         GetNum(sw, L"used_percent", 0));
-                if (!d->extraLines.empty()) d->extraLines += L"\n";
-                d->extraLines += line;
+        auto addLimitLine = [&](JsonObject const& item) {
+            auto itemRl = GetObj(item, L"rate_limit");
+            auto pw = GetObj(itemRl, L"primary_window");
+            auto sw = GetObj(itemRl, L"secondary_window");
+            std::wstring name = GetStr(item, L"limit_name");
+            if (name.empty() || (!pw && !sw)) return;
+            wchar_t line[128];
+            swprintf(line, ARRAYSIZE(line), L"%s: 5h %.0f%% | wk %.0f%%",
+                     name.c_str(), GetNum(pw, L"used_percent", 0),
+                     GetNum(sw, L"used_percent", 0));
+            if (!d->extraLines.empty()) d->extraLines += L"\n";
+            d->extraLines += line;
+        };
+        if (usage.HasKey(L"additional_rate_limits")) {
+            auto limits = usage.GetNamedValue(L"additional_rate_limits");
+            if (limits.ValueType() == JsonValueType::Array) {
+                auto arr = limits.GetArray();
+                for (uint32_t i = 0; i < arr.Size() && i < 3; i++) {
+                    if (arr.GetAt(i).ValueType() == JsonValueType::Object) addLimitLine(arr.GetAt(i).GetObject());
+                }
+            } else if (limits.ValueType() == JsonValueType::Object) {
+                addLimitLine(limits.GetObject());
             }
         }
 
-        if (auto cr = GetObj(root, L"credits"); cr && GetBool(cr, L"has_credits")) {
+        if (auto cr = GetObj(usage, L"credits"); cr && GetBool(cr, L"has_credits")) {
             double balance = GetNum(cr, L"balance", -1);
             if (balance < 0) {
                 std::wstring s = GetStr(cr, L"balance");
@@ -742,8 +683,11 @@ static bool ParseOpenAiUsage(const std::string& body, AccountData* d) {
                 d->extraLines += line;
             }
         }
-        return d->win5h.pct >= 0 || d->winWeek.pct >= 0;
+        bool parsed = d->win5h.pct >= 0 || d->winWeek.pct >= 0;
+        if (!parsed && error) *error = L"unexpected response format (" + DescribeJsonBody(body) + L")";
+        return parsed;
     } catch (...) {
+        if (error) *error = L"unexpected response format (" + DescribeJsonBody(body) + L")";
         return false;
     }
 }
@@ -797,11 +741,12 @@ static void FetchAccount(const AccountConfig& acc, AccountData* d, int* retryAft
     }
 
     AccountData fresh;
-    bool parsed = acc.provider == L"anthropic" ? ParseAnthropicUsage(r.body, &fresh)
-                                               : ParseOpenAiUsage(r.body, &fresh);
+    std::wstring parseError;
+    bool parsed = acc.provider == L"anthropic" ? ParseAnthropicUsage(r.body, &fresh, &parseError)
+                                               : ParseOpenAiUsage(r.body, &fresh, &parseError);
     if (!parsed) {
         d->stale = true;
-        d->error = L"unexpected response format";
+        d->error = parseError.empty() ? L"unexpected response format" : parseError;
         return;
     }
 
