@@ -2,7 +2,7 @@
 // @id              taskbar-ai-quota
 // @name            Taskbar AI Quota Bars
 // @description     Shows compact 5-hour and weekly AI agent/LLM subscription quota bars for Anthropic and OpenAI on the Windows 11 taskbar
-// @version         0.7.0
+// @version         0.7.1
 // @author          Cleroth
 // @include         explorer.exe
 // @architecture    x86-64
@@ -17,7 +17,7 @@ Shows Anthropic Claude and OpenAI/Codex AI agent and LLM subscription quota usag
 compact bars on the Windows 11 taskbar, next to the system tray.
 Can show on the primary taskbar only, all taskbars, or one specific monitor.
 
-![Taskbar AI Quota Bars](screenshot.png)
+![Taskbar AI Quota Bars](https://i.imgur.com/AsaacYF.png)
 
 Each account gets one compact column:
 - stacked layout: top bar = 5-hour usage, bottom bar = weekly usage

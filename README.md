@@ -3,7 +3,7 @@
 Shows Anthropic Claude and OpenAI/Codex AI agent and LLM subscription quota usage as compact bars on the Windows 11 taskbar.
 Can show on the primary taskbar only, all taskbars, or one specific monitor.
 
-![Taskbar AI Quota Bars](screenshot.png)
+![Taskbar AI Quota Bars](https://i.imgur.com/AsaacYF.png)
 
 ## What It Shows
 
