@@ -2,7 +2,7 @@
 // @id              taskbar-ai-quota
 // @name            Taskbar AI Quota Bars
 // @description     Shows compact 5-hour and weekly AI agent/LLM subscription quota bars for Anthropic and OpenAI on the Windows 11 taskbar
-// @version         0.6.3
+// @version         0.6.4
 // @author          Cleroth
 // @include         explorer.exe
 // @architecture    x86-64
@@ -242,6 +242,7 @@ struct AccountData {
     std::wstring extraLines;
     std::wstring error;
     ULONGLONG lastSuccessMs = 0;
+    ULONGLONG retryDeadlineMs = 0;
     bool stale = true;
 };
 
@@ -992,6 +993,7 @@ static bool ParseOpenAiUsage(const std::string& body, AccountData* d, std::wstri
 
 static void FetchAccount(const AccountConfig& acc, AccountData* d, int* retryAfterSec) {
     d->error.clear();
+    d->retryDeadlineMs = 0;
     AuthInfo auth = LoadAuthInfo(acc);
     if (!auth.ok) {
         d->stale = true;
@@ -1208,11 +1210,13 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
             FetchAccount(accounts[i], &results[i], &retryAfter);
             if (retryAfter > 0) {
                 retryDeadlineMs[i] = NowUnixMs() + (ULONGLONG)retryAfter * 1000;
+                results[i].retryDeadlineMs = retryDeadlineMs[i];
                 if (nextRetryMs == 0 || retryDeadlineMs[i] < nextRetryMs) {
                     nextRetryMs = retryDeadlineMs[i];
                 }
             } else {
                 retryDeadlineMs[i] = 0;
+                results[i].retryDeadlineMs = 0;
             }
 
             if (!results[i].error.empty()) {
@@ -1281,6 +1285,7 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
         ULONGLONG nowMs = NowUnixMs();
         if (nextRetryMs > nowMs) {
             waitMs = (DWORD)std::min<ULONGLONG>(waitMs, nextRetryMs - nowMs);
+            waitMs = std::min<DWORD>(waitMs, 1000);
         }
 
         HANDLE handles[2] = {g_stopEvent, g_refreshEvent};
@@ -1830,7 +1835,31 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
                 tip += L"\n" + d.codexSparkLines;
             }
             if (!d.extraLines.empty()) tip += L"\n" + d.extraLines;
-            if (!d.error.empty()) tip += L"\nerror: " + d.error;
+            if (!d.error.empty()) {
+                tip += L"\nerror: " + d.error;
+                if (d.retryDeadlineMs > now) {
+                    ULONGLONG retrySec = (d.retryDeadlineMs - now + 999) / 1000;
+                    ULONGLONG days = retrySec / (24 * 60 * 60);
+                    ULONGLONG hours = (retrySec / (60 * 60)) % 24;
+                    ULONGLONG mins = (retrySec / 60) % 60;
+                    ULONGLONG secs = retrySec % 60;
+                    wchar_t retry[64];
+                    if (days > 0) {
+                        if (hours > 0) swprintf(retry, ARRAYSIZE(retry), L"%llud %lluh", days, hours);
+                        else swprintf(retry, ARRAYSIZE(retry), L"%llud", days);
+                    } else if (hours > 0) {
+                        if (mins > 0) swprintf(retry, ARRAYSIZE(retry), L"%lluh %llum", hours, mins);
+                        else swprintf(retry, ARRAYSIZE(retry), L"%lluh", hours);
+                    } else if (mins > 0) {
+                        if (secs > 0) swprintf(retry, ARRAYSIZE(retry), L"%llum %llus", mins, secs);
+                        else swprintf(retry, ARRAYSIZE(retry), L"%llum", mins);
+                    } else {
+                        swprintf(retry, ARRAYSIZE(retry), L"%llus", secs);
+                    }
+                    tip += L" - retry in ";
+                    tip += retry;
+                }
+            }
             tip += L"\n" + FormatUpdated(d.lastSuccessMs, stale);
             tip += accountRefreshing ? L" - refreshing..." :
                    clickAction == ClickAction::OpenDashboard ? L" - click to open dashboard" :
