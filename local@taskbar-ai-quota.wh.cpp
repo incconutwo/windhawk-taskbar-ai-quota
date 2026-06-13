@@ -99,6 +99,10 @@ Default source: `%USERPROFILE%\.local\share\opencode\auth.json`.
 #include <winhttp.h>
 #include <unknwn.h>
 
+#ifndef WINHTTP_CALLBACK_FLAG_HANDLES
+#define WINHTTP_CALLBACK_FLAG_HANDLES WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING
+#endif
+
 #ifdef GetCurrentTime
 #undef GetCurrentTime
 #endif
@@ -574,7 +578,7 @@ static HttpResult HttpGet(PCWSTR host, PCWSTR path, PCWSTR userAgent,
                                      WINHTTP_CALLBACK_FLAG_DATA_AVAILABLE |
                                      WINHTTP_CALLBACK_FLAG_READ_COMPLETE |
                                      WINHTTP_CALLBACK_FLAG_REQUEST_ERROR |
-                                     WINHTTP_CALLBACK_FLAG_HANDLE_CLOSING,
+                                     WINHTTP_CALLBACK_FLAG_HANDLES,
                                  0) != WINHTTP_INVALID_STATUS_CALLBACK) {
         callbackSet = true;
     }
@@ -942,68 +946,52 @@ static HWND FindCurrentProcessTaskbarWnd() {
 
 static HRESULT TryGetTaskbarElementAbi(HWND hTaskbarWnd, void** result) {
     *result = nullptr;
-    HRESULT hr = E_FAIL;
     void* taskbarHostSharedPtr[2]{};
 
-    __try {
-        __try {
-            HWND hTaskSwWnd = (HWND)GetProp(hTaskbarWnd, L"TaskbandHWND");
-            if (!hTaskSwWnd) {
-                hr = E_HANDLE;
-                __leave;
-            }
+    auto cleanup = [&]() {
+        if (taskbarHostSharedPtr[1] && Std_Ref_Decref_Original) Std_Ref_Decref_Original(taskbarHostSharedPtr[1]);
+    };
 
-            void* taskBand = (void*)GetWindowLongPtrW(hTaskSwWnd, 0);
-            if (!taskBand) {
-                hr = E_POINTER;
-                __leave;
-            }
+    HWND hTaskSwWnd = (HWND)GetProp(hTaskbarWnd, L"TaskbandHWND");
+    if (!hTaskSwWnd) return E_HANDLE;
 
-            void* taskBandForTaskListWndSite = taskBand;
-            for (int i = 0; *(void**)taskBandForTaskListWndSite != CTaskBand_ITaskListWndSite_vftable; i++) {
-                if (i == 20) {
-                    hr = E_NOINTERFACE;
-                    __leave;
-                }
-                taskBandForTaskListWndSite = (void**)taskBandForTaskListWndSite + 1;
-                if (!taskBandForTaskListWndSite) {
-                    hr = E_POINTER;
-                    __leave;
-                }
-            }
+    void* taskBand = (void*)GetWindowLongPtrW(hTaskSwWnd, 0);
+    if (!taskBand) return E_POINTER;
 
-            CTaskBand_GetTaskbarHost_Original(taskBandForTaskListWndSite, taskbarHostSharedPtr);
-            if (!taskbarHostSharedPtr[0]) {
-                hr = E_POINTER;
-                __leave;
-            }
+    void* taskBandForTaskListWndSite = taskBand;
+    for (int i = 0; *(void**)taskBandForTaskListWndSite != CTaskBand_ITaskListWndSite_vftable; i++) {
+        if (i == 20) return E_NOINTERFACE;
+        taskBandForTaskListWndSite = (void**)taskBandForTaskListWndSite + 1;
+        if (!taskBandForTaskListWndSite) return E_POINTER;
+    }
 
-            size_t taskbarElementIUnknownOffset = 0x10;
-            const BYTE* b = (const BYTE*)TaskbarHost_FrameHeight_Original;
-            if (b[0] == 0x48 && b[1] == 0x83 && b[2] == 0xEC && b[4] == 0x48 &&
-                b[5] == 0x83 && b[6] == 0xC1 && b[7] <= 0x7F) {
-                taskbarElementIUnknownOffset = b[7];
-            } else {
-                Wh_Log(L"Unsupported TaskbarHost::FrameHeight pattern");
-            }
+    CTaskBand_GetTaskbarHost_Original(taskBandForTaskListWndSite, taskbarHostSharedPtr);
+    if (!taskbarHostSharedPtr[0]) {
+        cleanup();
+        return E_POINTER;
+    }
 
-            auto* taskbarElementIUnknown =
-                *(IUnknown**)((BYTE*)taskbarHostSharedPtr[0] + taskbarElementIUnknownOffset);
-            if (!taskbarElementIUnknown) {
-                hr = E_POINTER;
-                __leave;
-            }
+    size_t taskbarElementIUnknownOffset = 0x10;
+    const BYTE* b = (const BYTE*)TaskbarHost_FrameHeight_Original;
+    if (b[0] == 0x48 && b[1] == 0x83 && b[2] == 0xEC && b[4] == 0x48 &&
+        b[5] == 0x83 && b[6] == 0xC1 && b[7] <= 0x7F) {
+        taskbarElementIUnknownOffset = b[7];
+    } else {
+        Wh_Log(L"Unsupported TaskbarHost::FrameHeight pattern");
+    }
 
-            hr = taskbarElementIUnknown->QueryInterface(winrt::guid_of<FrameworkElement>(), result);
-        } __finally {
-            if (taskbarHostSharedPtr[1] && Std_Ref_Decref_Original) Std_Ref_Decref_Original(taskbarHostSharedPtr[1]);
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        if (*result) {
-            static_cast<IUnknown*>(*result)->Release();
-            *result = nullptr;
-        }
-        hr = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    auto* taskbarElementIUnknown =
+        *(IUnknown**)((BYTE*)taskbarHostSharedPtr[0] + taskbarElementIUnknownOffset);
+    if (!taskbarElementIUnknown) {
+        cleanup();
+        return E_POINTER;
+    }
+
+    HRESULT hr = taskbarElementIUnknown->QueryInterface(winrt::guid_of<FrameworkElement>(), result);
+    cleanup();
+    if (FAILED(hr) && *result) {
+        static_cast<IUnknown*>(*result)->Release();
+        *result = nullptr;
     }
 
     return hr;
