@@ -808,6 +808,8 @@ static void FetchAccount(const AccountConfig& acc, AccountData* d, int* retryAft
         r = HttpGet(L"api.anthropic.com", L"/api/oauth/usage", L"claude-code/2.1.0", headers);
     } else {
         std::wstring headers = L"Authorization: Bearer " + auth.accessToken +
+                               L"\r\nOrigin: https://chatgpt.com"
+                               L"\r\nReferer: https://chatgpt.com/"
                                L"\r\nAccept: application/json\r\n";
         if (!auth.accountId.empty()) headers += L"ChatGPT-Account-Id: " + auth.accountId + L"\r\n";
         r = HttpGet(L"chatgpt.com", L"/backend-api/wham/usage", L"taskbar-ai-quota/0.1", headers);
