@@ -1,7 +1,7 @@
 // ==WindhawkMod==
 // @id              taskbar-ai-quota
 // @name            Taskbar AI Quota Bars
-// @description     Shows LLM/agent quota usage for Anthropic and OpenAI as compact bars on the Windows 11 taskbar, left of the system tray
+// @description     Shows compact 5-hour and weekly AI agent/LLM subscription quota bars for Anthropic and OpenAI on the Windows 11 taskbar
 // @version         0.2
 // @author          Cleroth
 // @include         explorer.exe
@@ -13,22 +13,25 @@
 /*
 # Taskbar AI Quota Bars
 
-Shows Anthropic Claude and OpenAI Codex LLM/agent subscription quota usage directly on
-the Windows 11 taskbar, to the left of the system tray.
+Shows Anthropic Claude and OpenAI/Codex AI agent and LLM subscription quota usage as
+compact bars on the Windows 11 taskbar, next to the system tray.
 
 Each account gets one narrow column:
 - top bar: 5-hour usage
 - bottom bar: weekly usage
 
-Bars use green/yellow/orange/red threshold colors, and gray when stale.
-Enable colorblind mode to switch to a blue/orange palette.
+Hover for exact percentages and reset times. Click a column to refresh.
+Bars use configurable green/yellow/orange/red thresholds, with a colorblind palette option.
 Stale errors can mark labels/tooltips with `!`.
-Hover for exact percentages/reset times. Click a column to refresh.
 
-Credentials are read-only. The mod never refreshes or rewrites tokens.
-Default accounts read `%USERPROFILE%\.local\share\opencode\auth.json`.
-Other provider choices can read Claude Code's `%USERPROFILE%\.claude\.credentials.json`
-or Codex's `%USERPROFILE%\.codex\auth.json`.
+Supported credential sources:
+- OpenCode: `%USERPROFILE%\.local\share\opencode\auth.json`
+- Claude Code: `%USERPROFILE%\.claude\.credentials.json`
+- Codex: `%USERPROFILE%\.codex\auth.json`
+
+Credentials are read-only. The mod never refreshes or rewrites tokens, and never sends
+refresh tokens as bearer tokens. Run OpenCode, Claude Code, or Codex to refresh their
+own auth files if requests start returning `401`.
 */
 // ==/WindhawkModReadme==
 
@@ -123,9 +126,7 @@ or Codex's `%USERPROFILE%\.codex\auth.json`.
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cmath>
-#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -1244,7 +1245,7 @@ static void UpdateQuotaUi() {
             if (!d.extraLines.empty()) tip += L"\n" + d.extraLines;
             if (!d.error.empty()) tip += L"\nerror: " + d.error;
             tip += L"\n" + FormatUpdated(d.lastSuccessMs, stale);
-            tip += refreshing ? L"\nrefreshing..." : L"\nclick to refresh";
+            tip += refreshing ? L" - refreshing..." : L" - click to refresh";
 
             if (showPercentText) {
                 std::wstring percentText;
@@ -1553,6 +1554,14 @@ static void LoadSettings() {
     int yellowThreshold = Wh_GetIntSetting(L"yellowThreshold");
     int orangeThreshold = Wh_GetIntSetting(L"orangeThreshold");
     int redThreshold = Wh_GetIntSetting(L"redThreshold");
+
+    // Older configs do not have threshold keys; Windhawk reports missing ints as 0.
+    if (yellowThreshold == 0 && orangeThreshold == 0 && redThreshold == 0) {
+        yellowThreshold = 50;
+        orangeThreshold = 75;
+        redThreshold = 90;
+    }
+
     s.pollMinutes = std::clamp(pollMinutes > 0 ? pollMinutes : 10, 2, 24 * 60);
     s.barWidth = std::clamp(barWidth > 0 ? barWidth : 100, 10, 100);
     s.barHeight = std::clamp(barHeight > 0 ? barHeight : 8, 2, 20);
