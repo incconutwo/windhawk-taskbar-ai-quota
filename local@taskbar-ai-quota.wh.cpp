@@ -180,6 +180,7 @@ struct AppliedState {
     std::wstring percentText;
     std::wstring labelText;
     double labelOpacity = -1;
+    double columnOpacity = -1;
 };
 
 static Settings g_settings;
@@ -189,6 +190,7 @@ static std::mutex g_dataMutex;
 static std::vector<AppliedState> g_applied;
 
 static std::atomic<bool> g_unloading{false};
+static std::atomic<bool> g_refreshing{false};
 static HANDLE g_stopEvent = nullptr;
 static HANDLE g_refreshEvent = nullptr;
 static HANDLE g_fetchThread = nullptr;
@@ -866,6 +868,7 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
             std::lock_guard<std::mutex> lk(g_dataMutex);
             if (g_data.size() == results.size()) g_data = std::move(results);
         }
+        g_refreshing = false;
         PostUiUpdate();
 
         DWORD waitMs = (DWORD)intervalMin * 60000;
@@ -1138,6 +1141,8 @@ static Grid BuildQuotaGrid() {
             ToolTipService::SetToolTip(col, winrt::box_value(winrt::hstring(L"loading...")));
             ToolTipService::SetPlacement(col, wuxcp::PlacementMode::Top);
             col.Tapped([](winrt::Windows::Foundation::IInspectable const&, wuxi::TappedRoutedEventArgs const& e) {
+                g_refreshing = true;
+                UpdateQuotaUi();
                 if (g_refreshEvent) SetEvent(g_refreshEvent);
                 e.Handled(true);
             });
@@ -1181,6 +1186,7 @@ static void UpdateQuotaUi() {
     if (g_applied.size() != data.size()) g_applied.assign(data.size(), {});
 
     ULONGLONG now = NowUnixMs();
+    bool refreshing = g_refreshing.load();
     wchar_t name[64];
     try {
         for (size_t i = 0; i < data.size(); i++) {
@@ -1231,7 +1237,7 @@ static void UpdateQuotaUi() {
             if (!d.extraLines.empty()) tip += L"\n" + d.extraLines;
             if (!d.error.empty()) tip += L"\nerror: " + d.error;
             tip += L"\n" + FormatUpdated(d.lastSuccessMs, stale);
-            tip += L"\nclick to refresh";
+            tip += refreshing ? L"\nrefreshing..." : L"\nclick to refresh";
 
             if (showPercentText) {
                 std::wstring percentText;
@@ -1259,6 +1265,13 @@ static void UpdateQuotaUi() {
                     ToolTipService::SetToolTip(fe, winrt::box_value(winrt::hstring(tip)));
                 }
                 ap.tip = tip;
+            }
+
+            double columnOpacity = refreshing ? 0.65 : 1.0;
+            if (columnOpacity != ap.columnOpacity) {
+                swprintf(name, ARRAYSIZE(name), L"AiQuota_Acc_%d", (int)i);
+                if (auto fe = FindChildByName(g_quotaGrid, name)) fe.Opacity(columnOpacity);
+                ap.columnOpacity = columnOpacity;
             }
 
             double labelOpacity = stale ? 0.45 : 0.8;
