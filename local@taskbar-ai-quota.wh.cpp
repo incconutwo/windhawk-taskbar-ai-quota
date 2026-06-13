@@ -2,7 +2,7 @@
 // @id              taskbar-ai-quota
 // @name            Taskbar AI Quota Bars
 // @description     Shows compact 5-hour and weekly AI agent/LLM subscription quota bars for Anthropic and OpenAI on the Windows 11 taskbar
-// @version         0.6.1
+// @version         0.6.2
 // @author          Cleroth
 // @include         explorer.exe
 // @architecture    x86-64
@@ -265,6 +265,13 @@ struct MenuItemClickHandler {
     winrt::event_token token{};
 };
 
+struct AccountUiRefs {
+    StackPanel column{nullptr};
+    std::array<Border, 2> fills{Border{nullptr}, Border{nullptr}};
+    TextBlock percent{nullptr};
+    TextBlock label{nullptr};
+};
+
 struct QuotaUiInstance {
     HWND hWnd = nullptr;
     Grid quotaGrid{nullptr};
@@ -273,6 +280,7 @@ struct QuotaUiInstance {
     bool insertedColumn = false;
     std::vector<TapHandler> tapHandlers;
     std::vector<MenuItemClickHandler> menuItemClickHandlers;
+    std::vector<AccountUiRefs> accountRefs;
     std::vector<AppliedState> applied;
 };
 
@@ -1550,6 +1558,7 @@ static void ClearQuotaEventState(QuotaUiInstance& state) {
         try { handler.item.Click(handler.token); } catch (...) {}
     }
     state.menuItemClickHandlers.clear();
+    state.accountRefs.clear();
 }
 
 static Grid BuildQuotaGrid(QuotaUiInstance& state) {
@@ -1573,7 +1582,9 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
             labelOnLeft = g_settings.labelOnLeft;
             showPercentText = g_settings.showPercentText;
         }
+        state.accountRefs.clear();
         if (accounts.empty()) return nullptr;
+        state.accountRefs.reserve(accounts.size());
 
         Grid root;
         root.Name(kRootName);
@@ -1592,6 +1603,8 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
             col.Background(SolidColorBrush(winrt::Windows::UI::Color{0, 0, 0, 0}));
             swprintf(name, ARRAYSIZE(name), L"AiQuota_Acc_%d", (int)i);
             col.Name(name);
+            AccountUiRefs refs;
+            refs.column = col;
 
             if (showLabels) {
                 TextBlock label;
@@ -1604,6 +1617,7 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
                 label.Opacity(0.8);
                 swprintf(name, ARRAYSIZE(name), L"AiQuota_Label_%d", (int)i);
                 label.Name(name);
+                refs.label = label;
                 col.Children().Append(label);
             }
 
@@ -1630,6 +1644,7 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
                 fill.Background(SolidColorBrush(winrt::Windows::UI::Color{255, 0x9E, 0x9E, 0x9E}));
                 swprintf(name, ARRAYSIZE(name), L"AiQuota_Fill_%d_%d", (int)i, w);
                 fill.Name(name);
+                refs.fills[w] = fill;
 
                 track.Child(fill);
                 bars.Children().Append(track);
@@ -1651,6 +1666,7 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
                 percent.IsHitTestVisible(false);
                 swprintf(name, ARRAYSIZE(name), L"AiQuota_Percent_%d", (int)i);
                 percent.Name(name);
+                refs.percent = percent;
                 overlay.Children().Append(percent);
 
                 col.Children().Append(overlay);
@@ -1699,6 +1715,7 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
             tappedElement.ContextFlyout(menu);
 
             panel.Children().Append(col);
+            state.accountRefs.push_back(std::move(refs));
         }
 
         root.Children().Append(panel);
@@ -1738,16 +1755,17 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
         data = g_data;
     }
     if (data.size() != accounts.size()) return;
+    if (state.accountRefs.size() != data.size()) return;
     if (state.applied.size() != data.size()) state.applied.assign(data.size(), {});
 
     ULONGLONG now = NowUnixMs();
     bool refreshing = g_refreshing.load();
     int refreshAccountIndex = g_refreshAccountIndex.load();
-    wchar_t name[64];
     try {
         for (size_t i = 0; i < data.size(); i++) {
             const AccountData& d = data[i];
             AppliedState& ap = state.applied[i];
+            const AccountUiRefs& ui = state.accountRefs[i];
             bool stale = d.stale || d.lastSuccessMs == 0 ||
                          now - d.lastSuccessMs > (ULONGLONG)intervalMin * 2 * 60000;
             bool warn = showStaleWarning && stale && !d.error.empty();
@@ -1761,12 +1779,9 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
                 uint32_t cv = ((uint32_t)c.A << 24) | ((uint32_t)c.R << 16) |
                               ((uint32_t)c.G << 8) | c.B;
                 if (px != ap.fillPx[w] || cv != ap.fillColor[w]) {
-                    swprintf(name, ARRAYSIZE(name), L"AiQuota_Fill_%d_%d", (int)i, w);
-                    if (auto fe = FindChildByName(state.quotaGrid, name)) {
-                        if (auto b = fe.try_as<Border>()) {
-                            b.Width(px);
-                            b.Background(SolidColorBrush(c));
-                        }
+                    if (ui.fills[w]) {
+                        ui.fills[w].Width(px);
+                        ui.fills[w].Background(SolidColorBrush(c));
                     }
                     ap.fillPx[w] = px;
                     ap.fillColor[w] = cv;
@@ -1820,36 +1835,30 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
                     percentText = text;
                 }
                 if (percentText != ap.percentText) {
-                    swprintf(name, ARRAYSIZE(name), L"AiQuota_Percent_%d", (int)i);
-                    if (auto fe = FindChildByName(state.quotaGrid, name)) {
-                        if (auto tb = fe.try_as<TextBlock>()) tb.Text(percentText);
-                    }
+                    if (ui.percent) ui.percent.Text(percentText);
                     ap.percentText = percentText;
                 }
             }
 
             if (tip != ap.tip) {
-                swprintf(name, ARRAYSIZE(name), L"AiQuota_Acc_%d", (int)i);
-                if (auto fe = FindChildByName(state.quotaGrid, name)) {
-                    ToolTipService::SetToolTip(fe, winrt::box_value(winrt::hstring(tip)));
+                if (ui.column) {
+                    ToolTipService::SetToolTip(ui.column, winrt::box_value(winrt::hstring(tip)));
                 }
                 ap.tip = tip;
             }
 
             double columnOpacity = accountRefreshing ? 0.65 : 1.0;
             if (columnOpacity != ap.columnOpacity) {
-                swprintf(name, ARRAYSIZE(name), L"AiQuota_Acc_%d", (int)i);
-                if (auto fe = FindChildByName(state.quotaGrid, name)) fe.Opacity(columnOpacity);
+                if (ui.column) ui.column.Opacity(columnOpacity);
                 ap.columnOpacity = columnOpacity;
             }
 
             double labelOpacity = stale ? 0.45 : 0.8;
             std::wstring labelText = warn ? accounts[i].label + L"!" : accounts[i].label;
             if (labelOpacity != ap.labelOpacity || labelText != ap.labelText) {
-                swprintf(name, ARRAYSIZE(name), L"AiQuota_Label_%d", (int)i);
-                if (auto fe = FindChildByName(state.quotaGrid, name)) {
-                    fe.Opacity(labelOpacity);
-                    if (auto tb = fe.try_as<TextBlock>()) tb.Text(labelText);
+                if (ui.label) {
+                    ui.label.Opacity(labelOpacity);
+                    ui.label.Text(labelText);
                 }
                 ap.labelOpacity = labelOpacity;
                 ap.labelText = std::move(labelText);
