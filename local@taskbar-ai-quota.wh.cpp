@@ -2,7 +2,7 @@
 // @id              taskbar-ai-quota
 // @name            Taskbar AI Quota Bars
 // @description     Shows compact 5-hour and weekly AI agent/LLM subscription quota bars for Anthropic and OpenAI on the Windows 11 taskbar
-// @version         0.10.1
+// @version         0.10.2
 // @author          Cleroth
 // @github          https://github.com/Cleroth
 // @include         explorer.exe
@@ -48,6 +48,11 @@ the right-click menu):
 
 The mod refreshes the access token itself. Tokens are stored encrypted (Windows DPAPI).
 Use **Sign out** to remove a stored token.
+
+## Suggestions & bugs
+
+Have a suggestion or found a bug?
+[Open an issue](https://github.com/Cleroth/windhawk-taskbar-ai-quota/issues/new).
 */
 // ==/WindhawkModReadme==
 
@@ -3174,14 +3179,11 @@ static bool InjectQuotaGrid(HWND hWnd) {
         if (!root) return fail(L"no XamlRoot content");
         auto trayFrame = FindChildByName(root, L"SystemTrayFrameGrid");
         auto trayGrid = trayFrame ? trayFrame.try_as<Grid>() : nullptr;
-        bool overlayFallback = false;
-        if (!trayGrid) {
-            auto rootGrid = FindChildByName(root, L"RootGrid");
-            trayGrid = rootGrid ? rootGrid.try_as<Grid>() : nullptr;
-            if (!trayGrid) trayGrid = root.try_as<Grid>();
-            if (!trayGrid) return fail(L"no injection grid");
-            overlayFallback = true;
-        }
+        // On a cold start the XamlRoot is ready before the system tray contents are realized
+        // in the visual tree, so SystemTrayFrameGrid may be missing for the first attempts.
+        // Bail and let the retry loop poll until it appears; never inject elsewhere, which
+        // would render the bars on top of the clock/tray.
+        if (!trayGrid) return fail(L"no SystemTrayFrameGrid");
 
         state = FindUiState(hWnd);
         if (!state) {
@@ -3193,7 +3195,7 @@ static bool InjectQuotaGrid(HWND hWnd) {
         state->injectionParent = trayGrid;
 
         int oldCol = RemoveQuotaChildren(trayGrid, *state);
-        if (!overlayFallback && oldCol >= 0 && oldCol < (int)trayGrid.ColumnDefinitions().Size()) {
+        if (oldCol >= 0 && oldCol < (int)trayGrid.ColumnDefinitions().Size()) {
             for (uint32_t i = 0; i < trayGrid.Children().Size(); ++i) {
                 auto child = trayGrid.Children().GetAt(i).try_as<FrameworkElement>();
                 if (child) {
@@ -3214,28 +3216,16 @@ static bool InjectQuotaGrid(HWND hWnd) {
             return fail(L"BuildQuotaGrid failed");
         }
 
-        if (overlayFallback) {
-            quota.HorizontalAlignment(HorizontalAlignment::Right);
-            quota.VerticalAlignment(VerticalAlignment::Center);
-            quota.Margin({0, 0, 4, 0});
-            Grid::SetColumn(quota, 0);
-            Grid::SetRow(quota, 0);
-            Grid::SetColumnSpan(quota, std::max(1, (int)trayGrid.ColumnDefinitions().Size()));
-            Grid::SetRowSpan(quota, std::max(1, (int)trayGrid.RowDefinitions().Size()));
-            state->quotaColumn = -1;
-            state->insertedColumn = false;
-        } else {
-            ColumnDefinition newCol;
-            newCol.Width({1.0, GridUnitType::Auto});
-            trayGrid.ColumnDefinitions().InsertAt(0, newCol);
-            state->quotaColumn = 0;
-            state->insertedColumn = true;
-            for (uint32_t i = 0; i < trayGrid.Children().Size(); ++i) {
-                auto child = trayGrid.Children().GetAt(i).try_as<FrameworkElement>();
-                if (child) Grid::SetColumn(child, Grid::GetColumn(child) + 1);
-            }
-            Grid::SetColumn(quota, 0);
+        ColumnDefinition newCol;
+        newCol.Width({1.0, GridUnitType::Auto});
+        trayGrid.ColumnDefinitions().InsertAt(0, newCol);
+        state->quotaColumn = 0;
+        state->insertedColumn = true;
+        for (uint32_t i = 0; i < trayGrid.Children().Size(); ++i) {
+            auto child = trayGrid.Children().GetAt(i).try_as<FrameworkElement>();
+            if (child) Grid::SetColumn(child, Grid::GetColumn(child) + 1);
         }
+        Grid::SetColumn(quota, 0);
         trayGrid.Children().Append(quota);
 
         state->quotaGrid = quota;
