@@ -73,25 +73,35 @@ gh pr create -R ramensoftware/windhawk-mods -B main -H Cleroth:<branch>
 
 # Architecture (threading model)
 
-Single `.wh.cpp` injected into `explorer.exe`. Two execution domains:
+Single `.wh.cpp` injected into `explorer.exe`. Execution domains:
 
-- **Fetch thread** (`FetchThreadProc`): HTTP, JSON parsing, retry/backoff, and owns the tray
-  notify icon. It must NEVER touch XAML.
+- **Fetch thread** (`FetchThreadProc`): usage HTTP, JSON parsing, retry/backoff, token refresh,
+  and owns the tray notify icon. It must NEVER touch XAML.
+- **Login thread** (`LoginThreadProc`, one at a time, guarded by `g_loginInProgress`): runs an
+  OAuth sign-in - opens the browser, then either shows the Anthropic paste window (`g_loginWnd`,
+  with its own message loop) or runs the OpenAI loopback listener (`g_loginSocket`). It does
+  network + token storage but must NEVER touch XAML. Spawned from a taskbar UI thread by
+  `StartLogin`.
 - **Taskbar UI threads**: all XAML lives here. One `QuotaUiInstance` per taskbar window in
   `g_uiInstances`.
 
 Cross-thread UI work is marshaled with `RunFromWindowThread` (a `WH_CALLWNDPROC` hook +
 `SendMessageTimeout`). Resolve XAML refs only on the target UI thread: `PostUiUpdate` marshals
-first, then reads/updates XAML. Never resolve XAML refs on the fetch thread.
+first, then reads/updates XAML. Never resolve XAML refs on the fetch or login thread.
 
 # Concurrency rules
 
 - Lock order is `g_settingsMutex` before `g_dataMutex`. Never take them in the reverse order.
+  `g_authMutex` (token store) is independent and only held inside `LoadStoredToken`/
+  `SaveStoredToken`/`ClearStoredToken`; don't call other locked code while holding it.
 - `g_settingsGeneration` gates published data; `g_refreshGeneration` drives manual single-account
   refresh. Code that publishes to `g_data` must re-check the generation under lock (existing
   pattern in the publish block).
 - In-flight WinHTTP handles are tracked (`TrackHttpHandle`) so `Wh_ModUninit` can cancel them via
   `CloseActiveHttpHandles`. New network code must follow this or unload can hang.
+- A sign-in can block on a window message loop (Anthropic) or `select`/`accept` (OpenAI). Unload
+  unblocks it by posting `WM_CLOSE` to `g_loginWnd` and closing `g_loginSocket`, then joins
+  `g_loginThread`. Keep this path intact when changing the login flow.
 - Check `g_unloading` in loops and before slow/marshaled work.
 
 # Stability invariants (runs inside explorer.exe)
@@ -99,8 +109,8 @@ first, then reads/updates XAML. Never resolve XAML refs on the fetch thread.
 A crash takes down the shell. Keep it defensive:
 
 - Wrap WinRT/XAML calls in `try/catch` (existing pattern) and bail when `g_unloading`.
-- Unload must stay clean: set `g_unloading`, signal `g_stopEvent`, join threads, remove injected
-  UI, delete the tray icon.
+- Unload must stay clean: set `g_unloading`, signal `g_stopEvent`, unblock+join the login thread,
+  join the fetch/retry threads, remove injected UI, delete the tray icon, `WSACleanup`.
 
 # Symbol hooks are version-fragile
 
@@ -110,8 +120,17 @@ an offset. These can break on Windows updates. If bars stop showing, suspect the
 
 # Security invariant
 
-Credentials are read-only. Never write, refresh, or rotate tokens, and never send a refresh token
-as a bearer token. Preserve this when extending auth handling.
+The mod owns its OAuth credentials: it signs in (PKCE, using the public Claude Code / Codex
+clients), stores access+refresh tokens, and refreshes/rotates them itself. Preserve these rules
+when extending auth handling:
+
+- Never read or write the OpenCode/Claude Code/Codex credential files. The mod's tokens live only
+  in its own Windhawk storage (`auth_<identityHash>`), DPAPI-encrypted (current user) via
+  `DpapiProtect`/`DpapiUnprotect` - never persist tokens in plaintext.
+- Refresh tokens go only to the provider token endpoints; never send one as a bearer token to a
+  quota endpoint.
+- The token store is keyed by `AccountIdentityHash` (provider+label). Keep that stable or sign-ins
+  get orphaned.
 
 # Conventions
 

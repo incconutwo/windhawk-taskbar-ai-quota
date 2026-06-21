@@ -13,7 +13,7 @@ Each configured account gets one compact taskbar column:
 - stacked layout: top bar = 5-hour usage, bottom bar = weekly usage
 - vertical layout: side-by-side 5h | weekly bars, both filling bottom-up
 
-Hover for exact percentages and reset times. Click a column to refresh that account or open the provider dashboard, depending on settings. Right-click a column for Refresh all and Open dashboard.
+Hover for exact percentages and reset times. Click a column to refresh that account or open the provider dashboard, depending on settings. Right-click a column for Refresh all, Open dashboard, show/hide toggles, and Sign in / Sign out.
 
 Bars use configurable green/yellow/orange/red thresholds, with an optional colorblind palette. Stale errors can mark labels and tooltips with `!`.
 
@@ -21,28 +21,24 @@ It can also fire a Windows notification when an account first crosses the red th
 
 ## Setup
 
-Install the Windhawk mod from `local@taskbar-ai-quota.wh.cpp`, then configure accounts in the mod settings.
+Install the Windhawk mod from `local@taskbar-ai-quota.wh.cpp`. Configure accounts (provider + label) in the mod settings, then sign in to each from a quota column's right-click menu.
 
-Default accounts use OpenCode credentials for Anthropic and OpenAI. To use Claude Code or Codex credentials, change the account provider in settings.
+The default accounts are one Anthropic (`A`) and one OpenAI (`O`).
 
-## Credential Sources
+## Signing In
 
-The mod reads existing local auth files from OpenCode, Claude Code, or Codex.
+The mod runs its own OAuth sign-in and refreshes the access token itself, so the bars keep working without re-running any CLI. A column that needs authentication shows "click to sign in" - just left-click it to start the flow. You can also right-click a column, open **Sign in**, and pick the account:
 
-| Provider | Source | File | Token field |
-| --- | --- | --- | --- |
-| Anthropic | OpenCode | `%USERPROFILE%\.local\share\opencode\auth.json` | `anthropic.access` |
-| OpenAI | OpenCode | `%USERPROFILE%\.local\share\opencode\auth.json` | `openai.access` |
-| Anthropic | Claude Code | `%USERPROFILE%\.claude\.credentials.json` | `claudeAiOauth.accessToken` |
-| OpenAI | Codex | `%USERPROFILE%\.codex\auth.json` | `tokens.access_token` |
+- **Anthropic**: a browser opens to claude.ai. After you approve, the page shows a code like `abc...#xyz...`; paste it into the prompt the mod shows.
+- **OpenAI**: a browser opens to chatgpt.com; the mod catches the redirect on `localhost:1455` (falling back to `1457`) automatically, so there's nothing to paste. If the Codex CLI is signing in at the same time the port may be busy - close it and retry.
 
-For OpenCode, the auth key defaults to `anthropic` or `openai`. You can override it if your `auth.json` uses different keys.
+Use **Sign out** in the same menu to delete a stored token. The label is part of the account's identity, so renaming a label requires signing in again.
 
 ## Settings
 
 Useful settings include:
 
-- provider and credential source per account
+- provider (Anthropic or OpenAI) per account
 - account labels
 - bar length, thickness, and layout
 - bar mode: used (fills as quota is consumed) or remaining (fills with quota left, tooltips show "X% remaining")
@@ -58,15 +54,16 @@ Useful settings include:
 
 ## Security Notes
 
-Credentials are read-only. The mod never refreshes, rewrites, or rotates tokens. Refresh tokens are not bearer tokens and are not sent to quota endpoints.
+The mod owns its OAuth credentials end to end: it signs in, stores the access and refresh tokens, and refreshes them itself. Tokens are stored encrypted with Windows DPAPI (current user) in the mod's own Windhawk storage; they are never written to disk in plaintext.
 
-OpenCode, Claude Code, and Codex are responsible for refreshing their own auth files. If a token expires, run the owning app so it can refresh credentials, then refresh the taskbar quota display.
+The mod never reads or writes the OpenCode, Claude Code, or Codex credential files. Refresh tokens are used only against the provider token endpoints and are never sent as bearer tokens to the quota endpoints.
 
-Do not share auth files. They contain access tokens.
+Signing in uses the public OAuth clients of the official CLIs (Claude Code for Anthropic, Codex for OpenAI) with PKCE.
 
 ## Limitations
 
 - Windows 11 taskbar only.
 - Specific monitor numbers use taskbar order: `1` is primary, `2+` are secondary taskbars in monitor order.
-- Uses local auth files from supported tools.
-- Expired access tokens can cause `401` until the owning app refreshes them.
+- Requires signing in to each account once from the right-click menu.
+- OpenAI sign-in needs `localhost:1455` (or `1457`) free for the browser redirect.
+- Anthropic access tokens are short-lived but the mod refreshes them automatically; you only re-sign-in if the refresh token is revoked.
