@@ -1,14 +1,14 @@
 // ==WindhawkMod==
 // @id              taskbar-ai-quota
 // @name            Taskbar AI Quota Bars
-// @description     Shows compact 5-hour and weekly AI agent/LLM subscription quota bars for Anthropic and OpenAI on the Windows 11 taskbar
-// @version         0.10.3
+// @description     Shows compact 5-hour and weekly AI agent/LLM subscription quota bars for Anthropic, OpenAI, and Antigravity (Gemini) on the Windows 11 taskbar
+// @version         0.10.4
 // @author          Cleroth
 // @github          https://github.com/Cleroth
 // @include         explorer.exe
 // @architecture    x86-64
 // @license         MIT
-// @compilerOptions -DWIN32_LEAN_AND_MEAN -lole32 -loleaut32 -lruntimeobject -lwindowsapp -lwinhttp -luser32 -lshell32 -lgdi32 -lws2_32 -lcrypt32 -lbcrypt
+// @compilerOptions -DWIN32_LEAN_AND_MEAN -lole32 -loleaut32 -lruntimeobject -lwindowsapp -lwinhttp -luser32 -lshell32 -lgdi32 -lws2_32 -liphlpapi -lcrypt32 -lbcrypt -lwbemuuid
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -61,17 +61,20 @@ Have a suggestion or found a bug?
 - accounts:
     - - provider: anthropic
         $name: Provider
-        $description: 'Choose the API provider. Sign in per account from the right-click menu.'
+        $description: 'Choose the API provider. Sign in per account from the right-click menu (not needed for Gemini).'
         $options:
           - anthropic: Anthropic (Claude)
           - openai: OpenAI (ChatGPT/Codex)
+          - gemini: Antigravity (Gemini)
       - label: A
         $name: Label
-        $description: 'Default: A for Anthropic, O for OpenAI. The label also identifies the stored sign-in; renaming it requires signing in again.'
+        $description: 'Default: A for Anthropic, O for OpenAI, G for Gemini. The label also identifies the stored sign-in; renaming it requires signing in again.'
     - - provider: openai
       - label: O
+    - - provider: gemini
+      - label: G
   $name: Accounts
-  $description: 'Default: two accounts, Anthropic A and OpenAI O. Sign in to each from a quota column''s right-click menu.'
+  $description: 'Default: three accounts, Anthropic A, OpenAI O, and Antigravity G. Sign in to Anthropic/OpenAI from their column''s right-click menu. Gemini updates automatically.'
 - taskbarMonitorMode: primary
   $name: Taskbar monitors
   $description: 'Default: Primary only. Choose where quota bars are shown.'
@@ -201,6 +204,11 @@ Have a suggestion or found a bug?
 #include <string>
 #include <vector>
 
+#include <tlhelp32.h>
+#include <comdef.h>
+#include <Wbemidl.h>
+#include <iphlpapi.h>
+
 using namespace winrt::Windows::Data::Json;
 using namespace winrt::Windows::UI::Xaml;
 using namespace winrt::Windows::UI::Xaml::Controls;
@@ -329,9 +337,12 @@ struct AccountUiRefs {
 struct QuotaUiInstance {
     HWND hWnd = nullptr;
     Grid quotaGrid{nullptr};
-    Grid injectionParent{nullptr};
+    Panel injectionParent{nullptr};
     int quotaColumn = -1;
     bool insertedColumn = false;
+    int quotaRow = -1;
+    bool insertedRow = false;
+    bool isVerticalTaskbar = false;
     std::vector<PointerHandlers> pointerHandlers;
     std::vector<MenuItemClickHandler> menuItemClickHandlers;
     std::vector<AccountUiRefs> accountRefs;
@@ -749,8 +760,9 @@ static void OpenDashboardForAccount(int accountIndex) {
         provider = g_settings.accounts[accountIndex].provider;
     }
 
-    OpenUrl(provider == L"anthropic" ? L"https://claude.ai/settings/usage"
-                                     : L"https://chatgpt.com/codex/cloud/settings/analytics#usage");
+    OpenUrl(provider == L"anthropic" ? L"https://claude.ai/settings/usage" :
+            provider == L"gemini" ? L"https://antigravity.google" :
+            L"https://chatgpt.com/codex/cloud/settings/analytics#usage");
 }
 
 // Right-click menu: flip an account's show/hide state, keep at least one visible, persist the
@@ -2013,6 +2025,403 @@ static bool ParseOpenAiUsage(const std::string& body, AccountData* d, std::wstri
 }
 
 /**********************************************/
+//  Gemini (Antigravity) Local Discovery
+/**********************************************/
+
+struct GeminiServerInfo {
+    int port = 0;
+    std::wstring csrfToken;
+};
+
+static std::mutex g_geminiCacheMutex;
+static GeminiServerInfo g_geminiCachedInfo;
+static ULONGLONG g_geminiCacheTimeMs = 0;
+
+// Parse a flag value from a command line string: --flag_name value
+static std::wstring ParseCmdLineFlag(const std::wstring& cmdLine, const std::wstring& flag) {
+    std::wstring needle = L"--" + flag + L" ";
+    size_t pos = cmdLine.find(needle);
+    if (pos == std::wstring::npos) {
+        needle = L"--" + flag + L"=";
+        pos = cmdLine.find(needle);
+    }
+    if (pos == std::wstring::npos) return {};
+    size_t valStart = pos + needle.size();
+    // Skip leading whitespace after flag name (for space-separated form).
+    while (valStart < cmdLine.size() && cmdLine[valStart] == L' ') valStart++;
+    size_t valEnd = cmdLine.find(L' ', valStart);
+    if (valEnd == std::wstring::npos) valEnd = cmdLine.size();
+    return cmdLine.substr(valStart, valEnd - valStart);
+}
+
+// Uses WMI to get the command line of a process by PID.
+static std::wstring GetProcessCommandLineWmi(DWORD pid) {
+    std::wstring result;
+    IWbemLocator* locator = nullptr;
+    IWbemServices* services = nullptr;
+    IEnumWbemClassObject* enumerator = nullptr;
+
+    HRESULT hr = CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_IWbemLocator, (void**)&locator);
+    if (FAILED(hr) || !locator) return result;
+
+    hr = locator->ConnectServer(_bstr_t(L"ROOT\\CIMV2"), nullptr, nullptr, nullptr, 0,
+                                 nullptr, nullptr, &services);
+    if (FAILED(hr) || !services) {
+        locator->Release();
+        return result;
+    }
+
+    hr = CoSetProxyBlanket(services, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr,
+                            RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+                            nullptr, EOAC_NONE);
+    if (FAILED(hr)) {
+        services->Release();
+        locator->Release();
+        return result;
+    }
+
+    wchar_t query[128];
+    swprintf(query, ARRAYSIZE(query), L"SELECT CommandLine FROM Win32_Process WHERE ProcessId=%lu",
+             (unsigned long)pid);
+    hr = services->ExecQuery(_bstr_t(L"WQL"), _bstr_t(query),
+                              WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+                              nullptr, &enumerator);
+    if (SUCCEEDED(hr) && enumerator) {
+        IWbemClassObject* obj = nullptr;
+        ULONG returned = 0;
+        if (enumerator->Next(WBEM_INFINITE, 1, &obj, &returned) == S_OK && obj) {
+            VARIANT vt;
+            VariantInit(&vt);
+            if (SUCCEEDED(obj->Get(L"CommandLine", 0, &vt, nullptr, nullptr)) &&
+                vt.vt == VT_BSTR && vt.bstrVal) {
+                result = vt.bstrVal;
+            }
+            VariantClear(&vt);
+            obj->Release();
+        }
+        enumerator->Release();
+    }
+
+    services->Release();
+    locator->Release();
+    return result;
+}
+
+// Find the Antigravity language server process via netstat-equivalent API.
+static bool FindGeminiListeningPort(DWORD pid, int* outPort) {
+    // The language server listens on multiple ports. The ConnectRPC port is typically
+    // the one NOT listed as extension_server_port. We find all listening ports for the
+    // PID and pick the first one that isn't the extension_server_port.
+    // For simplicity, we try all listening ports in order until one responds.
+    *outPort = 0;
+
+    // Use GetExtendedTcpTable to find listening ports for this PID.
+    ULONG size = 0;
+    if (GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0)
+            != ERROR_INSUFFICIENT_BUFFER) {
+        return false;
+    }
+    std::vector<BYTE> buf(size);
+    if (GetExtendedTcpTable(buf.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) != NO_ERROR) {
+        return false;
+    }
+
+    auto* table = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(buf.data());
+    std::vector<int> ports;
+    for (DWORD i = 0; i < table->dwNumEntries; i++) {
+        if (table->table[i].dwOwningPid == pid) {
+            int port = ntohs((u_short)table->table[i].dwLocalPort);
+            ports.push_back(port);
+        }
+    }
+    if (ports.empty()) return false;
+
+    // Pick the lowest port that is NOT the extension_server_port (which will be
+    // parsed separately). The ConnectRPC port is typically the lowest.
+    std::sort(ports.begin(), ports.end());
+    *outPort = ports[0];
+    return true;
+}
+
+static bool DiscoverGeminiServer(GeminiServerInfo* info) {
+    info->port = 0;
+    info->csrfToken.clear();
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    DWORD foundPid = 0;
+
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, L"language_server_windows_x64.exe") == 0) {
+                // Prefer the instance with --enable_lsp (the active workspace one).
+                std::wstring cmdLine = GetProcessCommandLineWmi(pe.th32ProcessID);
+                if (cmdLine.empty()) continue;
+                std::wstring csrf = ParseCmdLineFlag(cmdLine, L"csrf_token");
+                if (csrf.empty()) continue;
+
+                // Check if this is a workspace-attached instance (has --enable_lsp or --parent_pipe_path).
+                bool isWorkspace = cmdLine.find(L"--enable_lsp") != std::wstring::npos ||
+                                   cmdLine.find(L"--parent_pipe_path") != std::wstring::npos;
+
+                if (isWorkspace || foundPid == 0) {
+                    info->csrfToken = csrf;
+                    foundPid = pe.th32ProcessID;
+                    // If it's a workspace instance, stop searching.
+                    if (isWorkspace) break;
+                }
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+
+    if (foundPid == 0 || info->csrfToken.empty()) return false;
+
+    // Find the listening port.
+    if (!FindGeminiListeningPort(foundPid, &info->port) || info->port == 0) return false;
+
+    return true;
+}
+
+// HTTPS request to localhost with self-signed cert (ignore validation).
+static HttpResult HttpRequestLocalHttps(int port, PCWSTR path, PCWSTR csrfToken) {
+    HttpResult res;
+    HINTERNET ses = WinHttpOpen(L"taskbar-ai-quota/0.1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (ses && !TrackHttpHandle(ses)) ses = nullptr;
+    HINTERNET con = nullptr;
+    HINTERNET req = nullptr;
+
+    if (ses && !g_unloading) {
+        WinHttpSetTimeouts(ses, 3000, 3000, 3000, 5000);
+        con = WinHttpConnect(ses, L"127.0.0.1", (INTERNET_PORT)port, 0);
+        if (con && !TrackHttpHandle(con)) con = nullptr;
+        req = con ? WinHttpOpenRequest(con, L"POST", path, nullptr,
+                                        WINHTTP_NO_REFERER,
+                                        WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                        WINHTTP_FLAG_SECURE)
+                  : nullptr;
+        if (req && !TrackHttpHandle(req)) req = nullptr;
+    }
+
+    // Disable SSL cert validation for localhost self-signed cert.
+    if (req) {
+        DWORD flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+                      SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                      SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                      SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+        WinHttpSetOption(req, WINHTTP_OPTION_SECURITY_FLAGS, &flags, sizeof(flags));
+    }
+
+    std::string body = "{}";
+    std::wstring headers = L"Content-Type: application/json\r\nConnect-Protocol-Version: 1\r\n";
+    if (csrfToken && *csrfToken) {
+        headers += L"X-Codeium-Csrf-Token: ";
+        headers += csrfToken;
+        headers += L"\r\n";
+    }
+
+    if (!g_unloading && req &&
+        WinHttpSendRequest(req, headers.c_str(), (DWORD)headers.size(),
+                           (LPVOID)body.data(), (DWORD)body.size(), (DWORD)body.size(), 0) &&
+        WinHttpReceiveResponse(req, nullptr)) {
+        DWORD status = 0, sz = sizeof(status);
+        WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz,
+                            WINHTTP_NO_HEADER_INDEX);
+        res.status = (int)status;
+
+        bool bodyOk = true;
+        for (;;) {
+            DWORD available = 0;
+            if (!WinHttpQueryDataAvailable(req, &available)) { bodyOk = false; break; }
+            if (!available) break;
+            size_t prev = res.body.size();
+            res.body.resize(prev + available);
+            DWORD read = 0;
+            if (!WinHttpReadData(req, res.body.data() + prev, available, &read)) {
+                res.body.resize(prev); bodyOk = false; break;
+            }
+            res.body.resize(prev + read);
+            if (!read || res.body.size() > 2 * 1024 * 1024) break;
+        }
+        res.ok = bodyOk;
+    }
+
+    if (req && UntrackHttpHandle(req)) WinHttpCloseHandle(req);
+    if (con && UntrackHttpHandle(con)) WinHttpCloseHandle(con);
+    if (ses && UntrackHttpHandle(ses)) WinHttpCloseHandle(ses);
+    return res;
+}
+
+static bool ParseGeminiQuotaSummary(const std::string& body, AccountData* d, std::wstring* error) {
+    try {
+        auto root = JsonObject::Parse(Utf8ToWide(body));
+        auto resp = GetObj(root, L"response");
+        if (!resp) {
+            if (error) *error = L"no response object";
+            return false;
+        }
+
+        if (!resp.HasKey(L"groups")) {
+            if (error) *error = L"no groups in response";
+            return false;
+        }
+        auto groupsVal = resp.GetNamedValue(L"groups");
+        if (groupsVal.ValueType() != JsonValueType::Array) {
+            if (error) *error = L"groups is not an array";
+            return false;
+        }
+
+        auto groups = groupsVal.GetArray();
+        bool foundGeminiGroup = false;
+        for (uint32_t i = 0; i < groups.Size(); ++i) {
+            if (groups.GetAt(i).ValueType() != JsonValueType::Object) continue;
+            auto grp = groups.GetAt(i).GetObject();
+            std::wstring dispName = GetStr(grp, L"displayName");
+            if (dispName != L"Gemini Models") continue;
+
+            foundGeminiGroup = true;
+            if (!grp.HasKey(L"buckets")) continue;
+            auto bucketsVal = grp.GetNamedValue(L"buckets");
+            if (bucketsVal.ValueType() != JsonValueType::Array) continue;
+
+            auto buckets = bucketsVal.GetArray();
+            for (uint32_t j = 0; j < buckets.Size(); ++j) {
+                if (buckets.GetAt(j).ValueType() != JsonValueType::Object) continue;
+                auto bucket = buckets.GetAt(j).GetObject();
+                std::wstring window = GetStr(bucket, L"window");
+                double remaining = GetNum(bucket, L"remainingFraction", -1);
+                std::wstring resetTimeStr = GetStr(bucket, L"resetTime");
+                ULONGLONG resetMs = ParseIso8601Ms(resetTimeStr);
+
+                if (remaining >= 0) {
+                    double usedPct = (1.0 - remaining) * 100.0;
+                    usedPct = std::clamp(usedPct, 0.0, 100.0);
+                    if (window == L"5h") {
+                        d->win5h.pct = usedPct;
+                        d->win5h.resetUnixMs = resetMs;
+                    } else if (window == L"weekly") {
+                        d->winWeek.pct = usedPct;
+                        d->winWeek.resetUnixMs = resetMs;
+                    }
+                }
+            }
+            break;
+        }
+
+        if (!foundGeminiGroup && error) {
+            *error = L"Gemini Models group not found in quota summary";
+        }
+        return foundGeminiGroup;
+    } catch (...) {
+        if (error) *error = L"failed to parse quota summary JSON";
+        return false;
+    }
+}
+
+static bool ParseGeminiPlanName(const std::string& body, AccountData* d, std::wstring* error) {
+    try {
+        auto root = JsonObject::Parse(Utf8ToWide(body));
+        auto userStatus = GetObj(root, L"userStatus");
+        if (!userStatus) {
+            if (error) *error = L"no userStatus object";
+            return false;
+        }
+        if (auto tier = GetObj(userStatus, L"userTier")) {
+            d->plan = GetStr(tier, L"name");
+        }
+        return true;
+    } catch (...) {
+        if (error) *error = L"failed to parse user status JSON";
+        return false;
+    }
+}
+
+static void FetchGeminiAccount(AccountData* d) {
+    d->error.clear();
+    d->retryDeadlineMs = 0;
+    d->needsLogin = false;
+
+    GeminiServerInfo info;
+    bool useCached = false;
+    {
+        std::lock_guard<std::mutex> lk(g_geminiCacheMutex);
+        if (g_geminiCachedInfo.port > 0 && !g_geminiCachedInfo.csrfToken.empty()) {
+            info = g_geminiCachedInfo;
+            useCached = true;
+        }
+    }
+
+    if (!useCached) {
+        if (!DiscoverGeminiServer(&info)) {
+            d->stale = true;
+            d->error = L"Antigravity not running";
+            return;
+        }
+        std::lock_guard<std::mutex> lk(g_geminiCacheMutex);
+        g_geminiCachedInfo = info;
+        g_geminiCacheTimeMs = NowUnixMs();
+    }
+
+    // Call RetrieveUserQuotaSummary to get the actual 5-hour and weekly usage
+    HttpResult r = HttpRequestLocalHttps(info.port,
+        L"/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary",
+        info.csrfToken.c_str());
+
+    // If the cached connection failed, re-discover and retry once.
+    if (useCached && (!r.ok || r.status != 200)) {
+        if (DiscoverGeminiServer(&info)) {
+            {
+                std::lock_guard<std::mutex> lk(g_geminiCacheMutex);
+                g_geminiCachedInfo = info;
+                g_geminiCacheTimeMs = NowUnixMs();
+            }
+            r = HttpRequestLocalHttps(info.port,
+                L"/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary",
+                info.csrfToken.c_str());
+        }
+    }
+
+    if (!r.ok) {
+        d->stale = true;
+        d->error = L"network error (language server)";
+        std::lock_guard<std::mutex> lk(g_geminiCacheMutex);
+        g_geminiCachedInfo = {};
+        return;
+    }
+    if (r.status != 200) {
+        d->stale = true;
+        d->error = L"HTTP " + std::to_wstring(r.status) + L" from language server";
+        return;
+    }
+
+    AccountData fresh;
+    std::wstring parseError;
+    if (!ParseGeminiQuotaSummary(r.body, &fresh, &parseError)) {
+        d->stale = true;
+        d->error = parseError.empty() ? L"unexpected response" : parseError;
+        return;
+    }
+
+    // Call GetUserStatus to get the plan name (e.g. "Google AI Pro")
+    HttpResult rStatus = HttpRequestLocalHttps(info.port,
+        L"/exa.language_server_pb.LanguageServerService/GetUserStatus",
+        info.csrfToken.c_str());
+    if (rStatus.ok && rStatus.status == 200) {
+        ParseGeminiPlanName(rStatus.body, &fresh, nullptr);
+    }
+
+    fresh.stale = false;
+    fresh.lastSuccessMs = NowUnixMs();
+    *d = std::move(fresh);
+}
+
+/**********************************************/
 //  Fetch Thread
 /**********************************************/
 
@@ -2020,6 +2429,12 @@ static void FetchAccount(const AccountConfig& acc, AccountData* d, int* retryAft
     d->error.clear();
     d->retryDeadlineMs = 0;
     d->needsLogin = false;
+
+    // Gemini uses local language server discovery, not OAuth.
+    if (acc.provider == L"gemini") {
+        FetchGeminiAccount(d);
+        return;
+    }
 
     uint64_t idHash = AccountIdentityHash(acc);
     ULONGLONG authEpoch = CurrentAuthEpoch(idHash);
@@ -2287,6 +2702,22 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
                 continue;
             }
 
+            bool due = false;
+            if (results[i].lastSuccessMs == 0 || results[i].stale || !results[i].error.empty()) {
+                due = true;
+            } else {
+                ULONGLONG elapsed = nowMs - results[i].lastSuccessMs;
+                if (accounts[i].provider == L"gemini") {
+                    due = (elapsed >= 60000); // Poll Gemini every 1 minute
+                } else {
+                    due = (elapsed >= (ULONGLONG)intervalMin * 60000); // Use settings interval for others
+                }
+            }
+
+            if (!due && !refreshSingleAccount && !(g_refreshing.load() && refreshAccountIndex < 0)) {
+                continue;
+            }
+
             int retryAfter = 0;
             FetchAccount(accounts[i], &results[i], &retryAfter);
             if (retryAfter > 0) {
@@ -2344,7 +2775,8 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
                     if (wu.pct >= redThreshold) {
                         if (st == 0 && enableNotifications) {
                             std::wstring providerName =
-                                accounts[i].provider == L"anthropic" ? L"Anthropic" : L"OpenAI";
+                                accounts[i].provider == L"anthropic" ? L"Anthropic" :
+                                accounts[i].provider == L"gemini" ? L"Gemini" : L"OpenAI";
                             wchar_t title[96];
                             swprintf(title, ARRAYSIZE(title), L"%s usage at %.0f%%",
                                      w == 0 ? L"5h" : L"weekly", wu.pct);
@@ -2361,12 +2793,32 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
         }
 
         DWORD waitMs = (DWORD)intervalMin * 60000;
-        if (anyError) waitMs = std::min(waitMs, (DWORD)120000);
         ULONGLONG nowMs = NowUnixMs();
+        ULONGLONG nextWakeMs = nowMs + 60000; // default wake in 1 minute
+        for (size_t i = 0; i < accounts.size(); i++) {
+            if (accounts[i].hidden) continue;
+            ULONGLONG accountDueMs = 0;
+            if (accounts[i].provider == L"gemini") {
+                accountDueMs = results[i].lastSuccessMs + 60000;
+            } else {
+                accountDueMs = results[i].lastSuccessMs + (ULONGLONG)intervalMin * 60000;
+            }
+            if (accountDueMs > nowMs && accountDueMs < nextWakeMs) {
+                nextWakeMs = accountDueMs;
+            }
+        }
+        if (nextWakeMs > nowMs) {
+            waitMs = (DWORD)std::min<ULONGLONG>(waitMs, nextWakeMs - nowMs);
+        } else {
+            waitMs = 1000;
+        }
+
+        if (anyError) waitMs = std::min(waitMs, (DWORD)120000);
         if (nextRetryMs > nowMs) {
             waitMs = (DWORD)std::min<ULONGLONG>(waitMs, nextRetryMs - nowMs);
             waitMs = std::min<DWORD>(waitMs, 1000);
         }
+        waitMs = std::max<DWORD>(waitMs, 1000); // at least 1 second
 
         HANDLE handles[2] = {g_stopEvent, g_refreshEvent};
         if (WaitForMultipleObjects(2, handles, FALSE, waitMs) == WAIT_OBJECT_0) break;
@@ -2707,6 +3159,17 @@ static void ClearQuotaEventState(QuotaUiInstance& state) {
     state.accountRefs.clear();
 }
 
+static bool IsVerticalTaskbar(HWND hWnd) {
+    if (!hWnd || !IsWindow(hWnd)) return false;
+    RECT rect = {0};
+    if (GetWindowRect(hWnd, &rect)) {
+        LONG w = rect.right - rect.left;
+        LONG h = rect.bottom - rect.top;
+        return w < h;
+    }
+    return false;
+}
+
 static Grid BuildQuotaGrid(QuotaUiInstance& state) {
     try {
         std::vector<AccountConfig> accounts;
@@ -2734,6 +3197,10 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
         if (accounts.empty()) return nullptr;
         state.accountRefs.reserve(accounts.size());
         bool verticalBars = barLayout == BarLayout::Vertical;
+        if (state.isVerticalTaskbar) {
+            verticalBars = true;
+            labelOnLeft = false;
+        }
         UINT toolTipDurationSeconds = 5;
         if (!SystemParametersInfoW(SPI_GETMESSAGEDURATION, 0, &toolTipDurationSeconds, 0)) {
             toolTipDurationSeconds = 5;
@@ -2755,11 +3222,20 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
 
         Grid root;
         root.Name(kRootName);
-        root.VerticalAlignment(VerticalAlignment::Center);
+        if (state.isVerticalTaskbar) {
+            root.HorizontalAlignment(HorizontalAlignment::Center);
+        } else {
+            root.VerticalAlignment(VerticalAlignment::Center);
+        }
 
         StackPanel panel;
-        panel.Orientation(Orientation::Horizontal);
-        panel.Margin({4, 0, (double)rightMargin, 0});
+        if (state.isVerticalTaskbar) {
+            panel.Orientation(Orientation::Vertical);
+            panel.Margin({0, 4, 0, (double)rightMargin});
+        } else {
+            panel.Orientation(Orientation::Horizontal);
+            panel.Margin({4, 0, (double)rightMargin, 0});
+        }
 
         wchar_t name[64];
         for (size_t i = 0; i < accounts.size(); i++) {
@@ -3048,8 +3524,10 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
             menu.Items().Append(MenuFlyoutSeparator{});
             for (size_t k = 0; k < accounts.size(); k++) {
                 ToggleMenuFlyoutItem toggle;
-                toggle.Text(accounts[k].label + L" - " +
-                            (accounts[k].provider == L"anthropic" ? L"Anthropic" : L"OpenAI"));
+                std::wstring providerName =
+                    accounts[k].provider == L"anthropic" ? L"Anthropic" :
+                    accounts[k].provider == L"gemini" ? L"Antigravity" : L"OpenAI";
+                toggle.Text(accounts[k].label + L" - " + providerName);
                 toggle.IsChecked(!accounts[k].hidden);
                 int toggleIndex = (int)k;
                 auto toggleToken = toggle.Click(
@@ -3062,13 +3540,14 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
                 menu.Items().Append(toggle);
             }
 
-            // Sign in / Sign out submenus drive the mod's own OAuth per account.
-            menu.Items().Append(MenuFlyoutSeparator{});
+            // Sign in / Sign out submenus drive the mod's own OAuth per account (skip for Gemini).
             MenuFlyoutSubItem signInSub;
             signInSub.Text(L"Sign in");
             MenuFlyoutSubItem signOutSub;
             signOutSub.Text(L"Sign out");
             for (size_t k = 0; k < accounts.size(); k++) {
+                if (accounts[k].provider == L"gemini") continue;
+
                 std::wstring name = accounts[k].label + L" - " +
                                     (accounts[k].provider == L"anthropic" ? L"Anthropic" : L"OpenAI");
                 int authIndex = (int)k;
@@ -3089,8 +3568,12 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
                 state.menuItemClickHandlers.push_back({signOutItem, signOutToken});
                 signOutSub.Items().Append(signOutItem);
             }
-            menu.Items().Append(signInSub);
-            menu.Items().Append(signOutSub);
+
+            if (signInSub.Items().Size() > 0) {
+                menu.Items().Append(MenuFlyoutSeparator{});
+                menu.Items().Append(signInSub);
+                menu.Items().Append(signOutSub);
+            }
 
             tappedElement.ContextFlyout(menu);
 
@@ -3146,6 +3629,9 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
     bool refreshing = g_refreshing.load();
     int refreshAccountIndex = g_refreshAccountIndex.load();
     bool verticalBars = barLayout == BarLayout::Vertical;
+    if (state.isVerticalTaskbar) {
+        verticalBars = true;
+    }
     // Remaining mode shows the quota left (100 - used); n/a (pct < 0) stays unchanged.
     auto displayPct = [&](double pct) {
         return barMode == BarMode::Remaining && pct >= 0 ? std::clamp(100.0 - pct, 0.0, 100.0) : pct;
@@ -3168,7 +3654,7 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
             }
             if (!visible) continue;
 
-            bool stale = d.stale || d.lastSuccessMs == 0 ||
+bool stale = d.stale || d.lastSuccessMs == 0 ||
                          now - d.lastSuccessMs > (ULONGLONG)intervalMin * 2 * 60000;
             bool warn = showStaleWarning && stale && !d.error.empty();
             bool accountRefreshing = refreshing && (refreshAccountIndex < 0 || refreshAccountIndex == (int)i);
@@ -3193,8 +3679,10 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
                 }
             }
 
-            std::wstring tip = (warn ? L"! " : L"") + accounts[i].label + L" - " +
-                               (accounts[i].provider == L"anthropic" ? L"Anthropic" : L"OpenAI");
+            std::wstring providerName =
+                accounts[i].provider == L"anthropic" ? L"Anthropic" :
+                accounts[i].provider == L"gemini" ? L"Antigravity" : L"OpenAI";
+            std::wstring tip = (warn ? L"! " : L"") + accounts[i].label + L" - " + providerName;
             bool planIsSpark = d.plan.find(L"Spark") != std::wstring::npos ||
                                d.plan.find(L"spark") != std::wstring::npos;
             if (!d.plan.empty() && (showCodexSparkInTooltip || !planIsSpark)) {
@@ -3304,7 +3792,7 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
     }
 }
 
-static int RemoveQuotaChildren(Grid const& targetGrid, QuotaUiInstance& state) {
+static int RemoveQuotaChildren(Panel const& targetGrid, QuotaUiInstance& state) {
     if (!targetGrid) return -1;
     ClearQuotaEventState(state);
 
@@ -3325,6 +3813,8 @@ static void RemoveQuotaGridFromState(QuotaUiInstance& state) {
         state.quotaGrid = nullptr;
         state.quotaColumn = -1;
         state.insertedColumn = false;
+        state.quotaRow = -1;
+        state.insertedRow = false;
         state.applied.clear();
         return;
     }
@@ -3333,15 +3823,32 @@ static void RemoveQuotaGridFromState(QuotaUiInstance& state) {
         auto targetGrid = state.injectionParent;
         int quotaCol = RemoveQuotaChildren(targetGrid, state);
         if (quotaCol < 0) quotaCol = state.quotaColumn;
-        if (state.insertedColumn && quotaCol >= 0 && quotaCol < (int)targetGrid.ColumnDefinitions().Size()) {
-            for (uint32_t i = 0; i < targetGrid.Children().Size(); ++i) {
-                auto child = targetGrid.Children().GetAt(i).try_as<FrameworkElement>();
-                if (child) {
-                    int childCol = Grid::GetColumn(child);
-                    if (childCol > quotaCol) Grid::SetColumn(child, childCol - 1);
+        int quotaRow = quotaCol;
+        if (quotaRow < 0) quotaRow = state.quotaRow;
+        
+        auto targetGridAsGrid = targetGrid.try_as<Grid>();
+        if (targetGridAsGrid) {
+            if (state.insertedColumn && quotaCol >= 0 && quotaCol < (int)targetGridAsGrid.ColumnDefinitions().Size()) {
+                for (uint32_t i = 0; i < targetGridAsGrid.Children().Size(); ++i) {
+                    auto child = targetGridAsGrid.Children().GetAt(i).try_as<FrameworkElement>();
+                    if (child) {
+                        int childCol = Grid::GetColumn(child);
+                        if (childCol > quotaCol) Grid::SetColumn(child, childCol - 1);
+                    }
                 }
+                targetGridAsGrid.ColumnDefinitions().RemoveAt(quotaCol);
             }
-            targetGrid.ColumnDefinitions().RemoveAt(quotaCol);
+
+            if (state.insertedRow && quotaRow >= 0 && quotaRow < (int)targetGridAsGrid.RowDefinitions().Size()) {
+                for (uint32_t i = 0; i < targetGridAsGrid.Children().Size(); ++i) {
+                    auto child = targetGridAsGrid.Children().GetAt(i).try_as<FrameworkElement>();
+                    if (child) {
+                        int childRow = Grid::GetRow(child);
+                        if (childRow > quotaRow) Grid::SetRow(child, childRow - 1);
+                    }
+                }
+                targetGridAsGrid.RowDefinitions().RemoveAt(quotaRow);
+            }
         }
     } catch (...) {
         Wh_Log(L"RemoveQuotaGrid: exception");
@@ -3351,8 +3858,12 @@ static void RemoveQuotaGridFromState(QuotaUiInstance& state) {
     state.injectionParent = nullptr;
     state.quotaColumn = -1;
     state.insertedColumn = false;
+    state.quotaRow = -1;
+    state.insertedRow = false;
     state.applied.clear();
 }
+
+static LRESULT CALLBACK TaskbarWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
 static bool InjectQuotaGrid(HWND hWnd) {
     if (!hWnd) return false;
@@ -3378,12 +3889,12 @@ static bool InjectQuotaGrid(HWND hWnd) {
         auto root = xamlRoot.Content().try_as<FrameworkElement>();
         if (!root) return fail(L"no XamlRoot content");
         auto trayFrame = FindChildByName(root, L"SystemTrayFrameGrid");
-        auto trayGrid = trayFrame ? trayFrame.try_as<Grid>() : nullptr;
+        auto trayPanel = trayFrame ? trayFrame.try_as<Panel>() : nullptr;
         // On a cold start the XamlRoot is ready before the system tray contents are realized
         // in the visual tree, so SystemTrayFrameGrid may be missing for the first attempts.
         // Bail and let the retry loop poll until it appears; never inject elsewhere, which
         // would render the bars on top of the clock/tray.
-        if (!trayGrid) return fail(L"no SystemTrayFrameGrid");
+        if (!trayPanel) return fail(L"no SystemTrayFrameGrid");
 
         state = FindUiState(hWnd);
         if (!state) {
@@ -3392,18 +3903,44 @@ static bool InjectQuotaGrid(HWND hWnd) {
             state = newState.get();
             g_uiInstances.push_back(std::move(newState));
         }
-        state->injectionParent = trayGrid;
+        state->isVerticalTaskbar = IsVerticalTaskbar(hWnd);
+        state->injectionParent = trayPanel;
 
-        int oldCol = RemoveQuotaChildren(trayGrid, *state);
-        if (oldCol >= 0 && oldCol < (int)trayGrid.ColumnDefinitions().Size()) {
-            for (uint32_t i = 0; i < trayGrid.Children().Size(); ++i) {
-                auto child = trayGrid.Children().GetAt(i).try_as<FrameworkElement>();
-                if (child) {
-                    int childCol = Grid::GetColumn(child);
-                    if (childCol > oldCol) Grid::SetColumn(child, childCol - 1);
+        // Subclass the window if not already subclassed to watch for WM_WINDOWPOSCHANGED
+        if (!GetPropW(hWnd, L"Windhawk_OldWndProc_" WH_MOD_ID)) {
+            WNDPROC oldWndProc = (WNDPROC)SetWindowLongPtrW(hWnd, GWLP_WNDPROC, (LONG_PTR)TaskbarWndProc);
+            if (oldWndProc) {
+                SetPropW(hWnd, L"Windhawk_OldWndProc_" WH_MOD_ID, (HANDLE)oldWndProc);
+            }
+        }
+
+        int oldCol = RemoveQuotaChildren(trayPanel, *state);
+        auto trayGrid = trayPanel.try_as<Grid>();
+        if (trayGrid) {
+            if (state->isVerticalTaskbar) {
+                int oldRow = oldCol;
+                if (oldRow >= 0 && oldRow < (int)trayGrid.RowDefinitions().Size()) {
+                    for (uint32_t i = 0; i < trayGrid.Children().Size(); ++i) {
+                        auto child = trayGrid.Children().GetAt(i).try_as<FrameworkElement>();
+                        if (child) {
+                            int childRow = Grid::GetRow(child);
+                            if (childRow > oldRow) Grid::SetRow(child, childRow - 1);
+                        }
+                    }
+                    trayGrid.RowDefinitions().RemoveAt(oldRow);
+                }
+            } else {
+                if (oldCol >= 0 && oldCol < (int)trayGrid.ColumnDefinitions().Size()) {
+                    for (uint32_t i = 0; i < trayGrid.Children().Size(); ++i) {
+                        auto child = trayGrid.Children().GetAt(i).try_as<FrameworkElement>();
+                        if (child) {
+                            int childCol = Grid::GetColumn(child);
+                            if (childCol > oldCol) Grid::SetColumn(child, childCol - 1);
+                        }
+                    }
+                    trayGrid.ColumnDefinitions().RemoveAt(oldCol);
                 }
             }
-            trayGrid.ColumnDefinitions().RemoveAt(oldCol);
         }
         Grid quota = BuildQuotaGrid(*state);
         if (!quota) {
@@ -3411,22 +3948,49 @@ static bool InjectQuotaGrid(HWND hWnd) {
             state->injectionParent = nullptr;
             state->quotaColumn = -1;
             state->insertedColumn = false;
+            state->quotaRow = -1;
+            state->insertedRow = false;
             state->applied.clear();
             EraseUiState(hWnd);
             return fail(L"BuildQuotaGrid failed");
         }
 
-        ColumnDefinition newCol;
-        newCol.Width({1.0, GridUnitType::Auto});
-        trayGrid.ColumnDefinitions().InsertAt(0, newCol);
-        state->quotaColumn = 0;
-        state->insertedColumn = true;
-        for (uint32_t i = 0; i < trayGrid.Children().Size(); ++i) {
-            auto child = trayGrid.Children().GetAt(i).try_as<FrameworkElement>();
-            if (child) Grid::SetColumn(child, Grid::GetColumn(child) + 1);
+        if (trayGrid) {
+            if (state->isVerticalTaskbar) {
+                RowDefinition newRow;
+                newRow.Height({1.0, GridUnitType::Auto});
+                trayGrid.RowDefinitions().InsertAt(0, newRow);
+                state->quotaRow = 0;
+                state->insertedRow = true;
+                for (uint32_t i = 0; i < trayGrid.Children().Size(); ++i) {
+                    auto child = trayGrid.Children().GetAt(i).try_as<FrameworkElement>();
+                    if (child) Grid::SetRow(child, Grid::GetRow(child) + 1);
+                }
+                Grid::SetRow(quota, 0);
+                Grid::SetColumn(quota, 0);
+                trayGrid.Children().Append(quota);
+            } else {
+                ColumnDefinition newCol;
+                newCol.Width({1.0, GridUnitType::Auto});
+                trayGrid.ColumnDefinitions().InsertAt(0, newCol);
+                state->quotaColumn = 0;
+                state->insertedColumn = true;
+                for (uint32_t i = 0; i < trayGrid.Children().Size(); ++i) {
+                    auto child = trayGrid.Children().GetAt(i).try_as<FrameworkElement>();
+                    if (child) Grid::SetColumn(child, Grid::GetColumn(child) + 1);
+                }
+                Grid::SetColumn(quota, 0);
+                Grid::SetRow(quota, 0);
+                trayGrid.Children().Append(quota);
+            }
+        } else {
+            // For StackPanel, just insert at the beginning (index 0)
+            trayPanel.Children().InsertAt(0, quota);
+            state->quotaColumn = 0;
+            state->quotaRow = 0;
+            state->insertedColumn = false;
+            state->insertedRow = false;
         }
-        Grid::SetColumn(quota, 0);
-        trayGrid.Children().Append(quota);
 
         state->quotaGrid = quota;
         g_uiInjected.store(true, std::memory_order_release);
@@ -3445,9 +4009,53 @@ static bool InjectQuotaGrid(HWND hWnd) {
     }
 }
 
+static LRESULT CALLBACK TaskbarWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    WNDPROC oldWndProc = (WNDPROC)GetPropW(hWnd, L"Windhawk_OldWndProc_" WH_MOD_ID);
+    if (!oldWndProc) return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+
+    static const UINT rebuildMsg = RegisterWindowMessage(L"Windhawk_RebuildQuotaGrid_" WH_MOD_ID);
+
+    if (uMsg == rebuildMsg) {
+        auto* state = FindUiState(hWnd);
+        if (state) {
+            RemoveQuotaGridFromState(*state);
+            InjectQuotaGrid(hWnd);
+        }
+        return 0;
+    }
+
+    if (uMsg == WM_WINDOWPOSCHANGED) {
+        auto* lpwp = reinterpret_cast<WINDOWPOS*>(lParam);
+        if (!(lpwp->flags & SWP_NOSIZE) || !(lpwp->flags & SWP_NOMOVE)) {
+            auto* state = FindUiState(hWnd);
+            if (state) {
+                bool isVertical = IsVerticalTaskbar(hWnd);
+                if (isVertical != state->isVerticalTaskbar) {
+                    PostMessageW(hWnd, rebuildMsg, 0, 0);
+                }
+            }
+        }
+    }
+
+    if (uMsg == WM_NCDESTROY) {
+        // Cleanup subclass
+        SetWindowLongPtrW(hWnd, GWLP_WNDPROC, (LONG_PTR)oldWndProc);
+        RemovePropW(hWnd, L"Windhawk_OldWndProc_" WH_MOD_ID);
+    }
+
+    return CallWindowProcW(oldWndProc, hWnd, uMsg, wParam, lParam);
+}
+
 static void RemoveQuotaGrid(HWND hWnd) {
     auto* state = FindUiState(hWnd);
     if (!state) return;
+
+    // Restore window subclass procedure
+    WNDPROC oldWndProc = (WNDPROC)GetPropW(hWnd, L"Windhawk_OldWndProc_" WH_MOD_ID);
+    if (oldWndProc) {
+        SetWindowLongPtrW(hWnd, GWLP_WNDPROC, (LONG_PTR)oldWndProc);
+        RemovePropW(hWnd, L"Windhawk_OldWndProc_" WH_MOD_ID);
+    }
 
     RemoveQuotaGridFromState(*state);
     EraseUiState(hWnd);
@@ -3599,14 +4207,23 @@ static void LoadSettings() {
         AccountConfig a;
         std::wstring providerSetting = provider;
         Wh_FreeStringSetting(provider);
-        // Bare "anthropic"/"openai"; older configs used "<provider>-<source>" - keep the provider.
-        a.provider = providerSetting.find(L"openai") != std::wstring::npos ? L"openai" : L"anthropic";
+        // Bare "anthropic"/"openai"/"gemini"; older configs used "<provider>-<source>" - keep the provider.
+        if (providerSetting.find(L"gemini") != std::wstring::npos)
+            a.provider = L"gemini";
+        else if (providerSetting.find(L"openai") != std::wstring::npos)
+            a.provider = L"openai";
+        else
+            a.provider = L"anthropic";
 
         PCWSTR label = Wh_GetStringSetting(L"accounts[%d].label", i);
         a.label = label;
         Wh_FreeStringSetting(label);
 
-        if (a.label.empty()) a.label = a.provider == L"anthropic" ? L"A" : L"O";
+        if (a.label.empty()) {
+            if (a.provider == L"anthropic") a.label = L"A";
+            else if (a.provider == L"openai") a.label = L"O";
+            else a.label = L"G";
+        }
         s.accounts.push_back(std::move(a));
     }
 
