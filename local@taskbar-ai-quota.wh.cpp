@@ -1,14 +1,14 @@
 // ==WindhawkMod==
 // @id              taskbar-ai-quota
 // @name            Taskbar AI Quota Bars
-// @description     Shows compact 5-hour and weekly AI agent/LLM subscription quota bars for Anthropic and OpenAI on the Windows 11 taskbar
+// @description     Shows compact 5-hour and weekly AI agent/LLM subscription quota bars for Anthropic, OpenAI, and Antigravity (Gemini) on the Windows 11 taskbar
 // @version         0.10.3
 // @author          Cleroth
 // @github          https://github.com/Cleroth
 // @include         explorer.exe
 // @architecture    x86-64
 // @license         MIT
-// @compilerOptions -DWIN32_LEAN_AND_MEAN -lole32 -loleaut32 -lruntimeobject -lwindowsapp -lwinhttp -luser32 -lshell32 -lgdi32 -lws2_32 -lcrypt32 -lbcrypt
+// @compilerOptions -DWIN32_LEAN_AND_MEAN -lole32 -loleaut32 -lruntimeobject -lwindowsapp -lwinhttp -luser32 -lshell32 -lgdi32 -lws2_32 -liphlpapi -lcrypt32 -lbcrypt -lwbemuuid
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -61,17 +61,20 @@ Have a suggestion or found a bug?
 - accounts:
     - - provider: anthropic
         $name: Provider
-        $description: 'Choose the API provider. Sign in per account from the right-click menu.'
+        $description: 'Choose the API provider. Sign in per account from the right-click menu (not needed for Gemini).'
         $options:
           - anthropic: Anthropic (Claude)
           - openai: OpenAI (ChatGPT/Codex)
+          - gemini: Antigravity (Gemini)
       - label: A
         $name: Label
-        $description: 'Default: A for Anthropic, O for OpenAI. The label also identifies the stored sign-in; renaming it requires signing in again.'
+        $description: 'Default: A for Anthropic, O for OpenAI, G for Gemini. The label also identifies the stored sign-in; renaming it requires signing in again.'
     - - provider: openai
       - label: O
+    - - provider: gemini
+      - label: G
   $name: Accounts
-  $description: 'Default: two accounts, Anthropic A and OpenAI O. Sign in to each from a quota column''s right-click menu.'
+  $description: 'Default: three accounts, Anthropic A, OpenAI O, and Antigravity G. Sign in to Anthropic/OpenAI from their column''s right-click menu. Gemini updates automatically.'
 - taskbarMonitorMode: primary
   $name: Taskbar monitors
   $description: 'Default: Primary only. Choose where quota bars are shown.'
@@ -200,6 +203,11 @@ Have a suggestion or found a bug?
 #include <mutex>
 #include <string>
 #include <vector>
+
+#include <tlhelp32.h>
+#include <comdef.h>
+#include <Wbemidl.h>
+#include <iphlpapi.h>
 
 using namespace winrt::Windows::Data::Json;
 using namespace winrt::Windows::UI::Xaml;
@@ -2013,6 +2021,388 @@ static bool ParseOpenAiUsage(const std::string& body, AccountData* d, std::wstri
 }
 
 /**********************************************/
+//  Gemini (Antigravity) Local Discovery
+/**********************************************/
+
+struct GeminiServerInfo {
+    int port = 0;
+    std::wstring csrfToken;
+};
+
+static std::mutex g_geminiCacheMutex;
+static GeminiServerInfo g_geminiCachedInfo;
+static ULONGLONG g_geminiCacheTimeMs = 0;
+
+// Parse a flag value from a command line string: --flag_name value
+static std::wstring ParseCmdLineFlag(const std::wstring& cmdLine, const std::wstring& flag) {
+    std::wstring needle = L"--" + flag + L" ";
+    size_t pos = cmdLine.find(needle);
+    if (pos == std::wstring::npos) {
+        needle = L"--" + flag + L"=";
+        pos = cmdLine.find(needle);
+    }
+    if (pos == std::wstring::npos) return {};
+    size_t valStart = pos + needle.size();
+    // Skip leading whitespace after flag name (for space-separated form).
+    while (valStart < cmdLine.size() && cmdLine[valStart] == L' ') valStart++;
+    size_t valEnd = cmdLine.find(L' ', valStart);
+    if (valEnd == std::wstring::npos) valEnd = cmdLine.size();
+    return cmdLine.substr(valStart, valEnd - valStart);
+}
+
+// Uses WMI to get the command line of a process by PID.
+static std::wstring GetProcessCommandLineWmi(DWORD pid) {
+    std::wstring result;
+    IWbemLocator* locator = nullptr;
+    IWbemServices* services = nullptr;
+    IEnumWbemClassObject* enumerator = nullptr;
+
+    HRESULT hr = CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_IWbemLocator, (void**)&locator);
+    if (FAILED(hr) || !locator) return result;
+
+    hr = locator->ConnectServer(_bstr_t(L"ROOT\\CIMV2"), nullptr, nullptr, nullptr, 0,
+                                 nullptr, nullptr, &services);
+    if (FAILED(hr) || !services) {
+        locator->Release();
+        return result;
+    }
+
+    hr = CoSetProxyBlanket(services, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr,
+                            RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+                            nullptr, EOAC_NONE);
+    if (FAILED(hr)) {
+        services->Release();
+        locator->Release();
+        return result;
+    }
+
+    wchar_t query[128];
+    swprintf(query, ARRAYSIZE(query), L"SELECT CommandLine FROM Win32_Process WHERE ProcessId=%lu",
+             (unsigned long)pid);
+    hr = services->ExecQuery(_bstr_t(L"WQL"), _bstr_t(query),
+                              WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+                              nullptr, &enumerator);
+    if (SUCCEEDED(hr) && enumerator) {
+        IWbemClassObject* obj = nullptr;
+        ULONG returned = 0;
+        if (enumerator->Next(WBEM_INFINITE, 1, &obj, &returned) == S_OK && obj) {
+            VARIANT vt;
+            VariantInit(&vt);
+            if (SUCCEEDED(obj->Get(L"CommandLine", 0, &vt, nullptr, nullptr)) &&
+                vt.vt == VT_BSTR && vt.bstrVal) {
+                result = vt.bstrVal;
+            }
+            VariantClear(&vt);
+            obj->Release();
+        }
+        enumerator->Release();
+    }
+
+    services->Release();
+    locator->Release();
+    return result;
+}
+
+// Find the Antigravity language server process via netstat-equivalent API.
+static bool FindGeminiListeningPort(DWORD pid, int* outPort) {
+    *outPort = 0;
+
+    ULONG size = 0;
+    if (GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0)
+            != ERROR_INSUFFICIENT_BUFFER) {
+        return false;
+    }
+    std::vector<BYTE> buf(size);
+    if (GetExtendedTcpTable(buf.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0) != NO_ERROR) {
+        return false;
+    }
+
+    auto* table = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(buf.data());
+    std::vector<int> ports;
+    for (DWORD i = 0; i < table->dwNumEntries; i++) {
+        if (table->table[i].dwOwningPid == pid) {
+            int port = ntohs((u_short)table->table[i].dwLocalPort);
+            ports.push_back(port);
+        }
+    }
+    if (ports.empty()) return false;
+
+    std::sort(ports.begin(), ports.end());
+    *outPort = ports[0];
+    return true;
+}
+
+static bool DiscoverGeminiServer(GeminiServerInfo* info) {
+    info->port = 0;
+    info->csrfToken.clear();
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    DWORD foundPid = 0;
+
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, L"language_server_windows_x64.exe") == 0) {
+                std::wstring cmdLine = GetProcessCommandLineWmi(pe.th32ProcessID);
+                if (cmdLine.empty()) continue;
+                std::wstring csrf = ParseCmdLineFlag(cmdLine, L"csrf_token");
+                if (csrf.empty()) continue;
+
+                bool isWorkspace = cmdLine.find(L"--enable_lsp") != std::wstring::npos ||
+                                   cmdLine.find(L"--parent_pipe_path") != std::wstring::npos;
+
+                if (isWorkspace || foundPid == 0) {
+                    info->csrfToken = csrf;
+                    foundPid = pe.th32ProcessID;
+                    if (isWorkspace) break;
+                }
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+
+    if (foundPid == 0 || info->csrfToken.empty()) return false;
+
+    if (!FindGeminiListeningPort(foundPid, &info->port) || info->port == 0) return false;
+
+    return true;
+}
+
+// HTTPS request to localhost with self-signed cert (ignore validation).
+static HttpResult HttpRequestLocalHttps(int port, PCWSTR path, PCWSTR csrfToken) {
+    HttpResult res;
+    HINTERNET ses = WinHttpOpen(L"taskbar-ai-quota/0.1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (ses && !TrackHttpHandle(ses)) ses = nullptr;
+    HINTERNET con = nullptr;
+    HINTERNET req = nullptr;
+
+    if (ses && !g_unloading) {
+        WinHttpSetTimeouts(ses, 3000, 3000, 3000, 5000);
+        con = WinHttpConnect(ses, L"127.0.0.1", (INTERNET_PORT)port, 0);
+        if (con && !TrackHttpHandle(con)) con = nullptr;
+        req = con ? WinHttpOpenRequest(con, L"POST", path, nullptr,
+                                        WINHTTP_NO_REFERER,
+                                        WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                        WINHTTP_FLAG_SECURE)
+                  : nullptr;
+        if (req && !TrackHttpHandle(req)) req = nullptr;
+    }
+
+    if (req) {
+        DWORD flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+                      SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                      SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                      SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+        WinHttpSetOption(req, WINHTTP_OPTION_SECURITY_FLAGS, &flags, sizeof(flags));
+    }
+
+    std::string body = "{}";
+    std::wstring headers = L"Content-Type: application/json\r\nConnect-Protocol-Version: 1\r\n";
+    if (csrfToken && *csrfToken) {
+        headers += L"X-Codeium-Csrf-Token: ";
+        headers += csrfToken;
+        headers += L"\r\n";
+    }
+
+    if (!g_unloading && req &&
+        WinHttpSendRequest(req, headers.c_str(), (DWORD)headers.size(),
+                           (LPVOID)body.data(), (DWORD)body.size(), (DWORD)body.size(), 0) &&
+        WinHttpReceiveResponse(req, nullptr)) {
+        DWORD status = 0, sz = sizeof(status);
+        WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz,
+                            WINHTTP_NO_HEADER_INDEX);
+        res.status = (int)status;
+
+        bool bodyOk = true;
+        for (;;) {
+            DWORD available = 0;
+            if (!WinHttpQueryDataAvailable(req, &available)) { bodyOk = false; break; }
+            if (!available) break;
+            size_t prev = res.body.size();
+            res.body.resize(prev + available);
+            DWORD read = 0;
+            if (!WinHttpReadData(req, res.body.data() + prev, available, &read)) {
+                res.body.resize(prev); bodyOk = false; break;
+            }
+            res.body.resize(prev + read);
+            if (!read || res.body.size() > 2 * 1024 * 1024) break;
+        }
+        res.ok = bodyOk;
+    }
+
+    if (req && UntrackHttpHandle(req)) WinHttpCloseHandle(req);
+    if (con && UntrackHttpHandle(con)) WinHttpCloseHandle(con);
+    if (ses && UntrackHttpHandle(ses)) WinHttpCloseHandle(ses);
+    return res;
+}
+
+static bool ParseGeminiQuotaSummary(const std::string& body, AccountData* d, std::wstring* error) {
+    try {
+        auto root = JsonObject::Parse(Utf8ToWide(body));
+        auto resp = GetObj(root, L"response");
+        if (!resp) {
+            if (error) *error = L"no response object";
+            return false;
+        }
+
+        if (!resp.HasKey(L"groups")) {
+            if (error) *error = L"no groups in response";
+            return false;
+        }
+        auto groupsVal = resp.GetNamedValue(L"groups");
+        if (groupsVal.ValueType() != JsonValueType::Array) {
+            if (error) *error = L"groups is not an array";
+            return false;
+        }
+
+        auto groups = groupsVal.GetArray();
+        bool foundGeminiGroup = false;
+        for (uint32_t i = 0; i < groups.Size(); ++i) {
+            if (groups.GetAt(i).ValueType() != JsonValueType::Object) continue;
+            auto grp = groups.GetAt(i).GetObject();
+            std::wstring dispName = GetStr(grp, L"displayName");
+            if (dispName != L"Gemini Models") continue;
+
+            foundGeminiGroup = true;
+            if (!grp.HasKey(L"buckets")) continue;
+            auto bucketsVal = grp.GetNamedValue(L"buckets");
+            if (bucketsVal.ValueType() != JsonValueType::Array) continue;
+
+            auto buckets = bucketsVal.GetArray();
+            for (uint32_t j = 0; j < buckets.Size(); ++j) {
+                if (buckets.GetAt(j).ValueType() != JsonValueType::Object) continue;
+                auto bucket = buckets.GetAt(j).GetObject();
+                std::wstring window = GetStr(bucket, L"window");
+                double remaining = GetNum(bucket, L"remainingFraction", -1);
+                std::wstring resetTimeStr = GetStr(bucket, L"resetTime");
+                ULONGLONG resetMs = ParseIso8601Ms(resetTimeStr);
+
+                if (remaining >= 0) {
+                    double usedPct = (1.0 - remaining) * 100.0;
+                    usedPct = std::clamp(usedPct, 0.0, 100.0);
+                    if (window == L"5h") {
+                        d->win5h.pct = usedPct;
+                        d->win5h.resetUnixMs = resetMs;
+                    } else if (window == L"weekly") {
+                        d->winWeek.pct = usedPct;
+                        d->winWeek.resetUnixMs = resetMs;
+                    }
+                }
+            }
+            break;
+        }
+
+        if (!foundGeminiGroup && error) {
+            *error = L"Gemini Models group not found in quota summary";
+        }
+        return foundGeminiGroup;
+    } catch (...) {
+        if (error) *error = L"failed to parse quota summary JSON";
+        return false;
+    }
+}
+
+static bool ParseGeminiPlanName(const std::string& body, AccountData* d, std::wstring* error) {
+    try {
+        auto root = JsonObject::Parse(Utf8ToWide(body));
+        auto userStatus = GetObj(root, L"userStatus");
+        if (!userStatus) {
+            if (error) *error = L"no userStatus object";
+            return false;
+        }
+        if (auto tier = GetObj(userStatus, L"userTier")) {
+            d->plan = GetStr(tier, L"name");
+        }
+        return true;
+    } catch (...) {
+        if (error) *error = L"failed to parse user status JSON";
+        return false;
+    }
+}
+
+static void FetchGeminiAccount(AccountData* d) {
+    d->error.clear();
+    d->retryDeadlineMs = 0;
+    d->needsLogin = false;
+
+    GeminiServerInfo info;
+    bool useCached = false;
+    {
+        std::lock_guard<std::mutex> lk(g_geminiCacheMutex);
+        if (g_geminiCachedInfo.port > 0 && !g_geminiCachedInfo.csrfToken.empty()) {
+            info = g_geminiCachedInfo;
+            useCached = true;
+        }
+    }
+
+    if (!useCached) {
+        if (!DiscoverGeminiServer(&info)) {
+            d->stale = true;
+            d->error = L"Antigravity not running";
+            return;
+        }
+        std::lock_guard<std::mutex> lk(g_geminiCacheMutex);
+        g_geminiCachedInfo = info;
+        g_geminiCacheTimeMs = NowUnixMs();
+    }
+
+    HttpResult r = HttpRequestLocalHttps(info.port,
+        L"/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary",
+        info.csrfToken.c_str());
+
+    if (useCached && (!r.ok || r.status != 200)) {
+        if (DiscoverGeminiServer(&info)) {
+            {
+                std::lock_guard<std::mutex> lk(g_geminiCacheMutex);
+                g_geminiCachedInfo = info;
+                g_geminiCacheTimeMs = NowUnixMs();
+            }
+            r = HttpRequestLocalHttps(info.port,
+                L"/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary",
+                info.csrfToken.c_str());
+        }
+    }
+
+    if (!r.ok) {
+        d->stale = true;
+        d->error = L"network error (language server)";
+        std::lock_guard<std::mutex> lk(g_geminiCacheMutex);
+        g_geminiCachedInfo = {};
+        return;
+    }
+    if (r.status != 200) {
+        d->stale = true;
+        d->error = L"HTTP " + std::to_wstring(r.status) + L" from language server";
+        return;
+    }
+
+    AccountData fresh;
+    std::wstring parseError;
+    if (!ParseGeminiQuotaSummary(r.body, &fresh, &parseError)) {
+        d->stale = true;
+        d->error = parseError.empty() ? L"unexpected response" : parseError;
+        return;
+    }
+
+    HttpResult rStatus = HttpRequestLocalHttps(info.port,
+        L"/exa.language_server_pb.LanguageServerService/GetUserStatus",
+        info.csrfToken.c_str());
+    if (rStatus.ok && rStatus.status == 200) {
+        ParseGeminiPlanName(rStatus.body, &fresh, nullptr);
+    }
+
+    fresh.stale = false;
+    fresh.lastSuccessMs = NowUnixMs();
+    *d = std::move(fresh);
+}
+
+/**********************************************/
 //  Fetch Thread
 /**********************************************/
 
@@ -2020,6 +2410,12 @@ static void FetchAccount(const AccountConfig& acc, AccountData* d, int* retryAft
     d->error.clear();
     d->retryDeadlineMs = 0;
     d->needsLogin = false;
+
+    // Gemini uses local language server discovery, not OAuth.
+    if (acc.provider == L"gemini") {
+        FetchGeminiAccount(d);
+        return;
+    }
 
     uint64_t idHash = AccountIdentityHash(acc);
     ULONGLONG authEpoch = CurrentAuthEpoch(idHash);
